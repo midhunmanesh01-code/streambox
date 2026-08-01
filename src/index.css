@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-stage-950 text-ink-100 font-body antialiased;
+  }
+  ::selection {
+    @apply bg-brass-400/30 text-ink-100;
+  }
+  *:focus-visible {
+    outline: 2px solid theme('colors.brass.400');
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  .film-grain {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.4'/%3E%3C/svg%3E");
+    mix-blend-mode: overlay;
+  }
+  .marquee-text {
+    letter-spacing: 0.32em;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: theme('colors.stage.600');
+    border-radius: 999px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
