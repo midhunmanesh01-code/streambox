@@ -1,5 +1,5 @@
 import { AlertTriangle, CheckCircle2, FileVideo, X } from 'lucide-react'
-import { formatBytes } from '../utils/mockApi.js'
+import { formatBytes } from '../utils/api.js'
 
 export default function UploadProgress({ file, percent, uploadedBytes, status, error, onCancel }) {
   return (
@@ -41,7 +41,11 @@ export default function UploadProgress({ file, percent, uploadedBytes, status, e
                   {status === 'success' && (
                     <CheckCircle2 className="w-3.5 h-3.5 text-signal-green" strokeWidth={2} />
                   )}
-                  {status === 'success' ? 'Complete' : `${percent}%`}
+                  {status === 'processing'
+                    ? 'Preparing video for playback…'
+                    : status === 'success'
+                      ? 'Complete'
+                      : `${percent}%`}
                 </span>
               </div>
             </div>

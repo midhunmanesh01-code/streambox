@@ -1,7 +1,13 @@
 import { useCallback, useRef, useState } from 'react'
 import { UploadCloud } from 'lucide-react'
 import UploadProgress from './UploadProgress.jsx'
-import { MAX_UPLOAD_BYTES, formatBytes, simulateUpload } from '../utils/mockApi.js'
+import {
+  MAX_UPLOAD_BYTES,
+  apiInitUpload,
+  apiUploadFile,
+  formatBytes,
+  waitForVideoReady,
+} from '../utils/api.js'
 
 export default function VideoUploader({ onUploadComplete, autoOpen }) {
   const inputRef = useRef(null)
@@ -9,12 +15,12 @@ export default function VideoUploader({ onUploadComplete, autoOpen }) {
 
   const [isDragging, setIsDragging] = useState(false)
   const [file, setFile] = useState(null)
-  const [status, setStatus] = useState('idle') // idle | uploading | success | error
+  const [status, setStatus] = useState('idle') // idle | uploading | processing | success | error
   const [percent, setPercent] = useState(0)
   const [uploadedBytes, setUploadedBytes] = useState(0)
   const [error, setError] = useState('')
 
-  const startUpload = useCallback((selected) => {
+  const startUpload = useCallback(async (selected) => {
     if (!selected) return
 
     if (selected.size > MAX_UPLOAD_BYTES) {
@@ -30,20 +36,28 @@ export default function VideoUploader({ onUploadComplete, autoOpen }) {
     setUploadedBytes(0)
     setError('')
 
-    controllerRef.current = simulateUpload(selected, {
-      onProgress: (pct, uploaded) => {
-        setPercent(pct)
-        setUploadedBytes(uploaded)
-      },
-      onComplete: () => {
-        setStatus('success')
-        setTimeout(() => onUploadComplete(selected), 500)
-      },
-      onError: (message) => {
-        setStatus('error')
-        setError(message)
-      },
-    })
+    try {
+      const uploadSession = await apiInitUpload(selected)
+      const upload = apiUploadFile(uploadSession.upload_url, selected, {
+        onProgress: (uploaded, total) => {
+          setPercent(Math.round((uploaded / total) * 100))
+          setUploadedBytes(uploaded)
+        },
+      })
+
+      controllerRef.current = upload
+      await upload.promise
+      setStatus('processing')
+      setPercent(100)
+      setUploadedBytes(selected.size)
+
+      const readyVideo = await waitForVideoReady(uploadSession.upload_session_id)
+      setStatus('success')
+      setTimeout(() => onUploadComplete(readyVideo), 300)
+    } catch (uploadError) {
+      setStatus('error')
+      setError(uploadError.message || 'Upload failed.')
+    }
   }, [onUploadComplete])
 
   const handleCancel = () => {

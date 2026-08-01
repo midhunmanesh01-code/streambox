@@ -1,30 +1,71 @@
-import { createContext, useContext, useState } from 'react'
+import { createContext, useContext, useEffect, useState } from 'react'
+import { apiDeleteCurrentVideo, apiGetCurrentVideo } from '../utils/api.js'
+import { useAuth } from './AuthContext.jsx'
 
 const VideoContext = createContext(null)
 
-// Shape of the "current video" record. Later this comes from
-// GET /api/video/current instead of local state.
 export function VideoProvider({ children }) {
   const [video, setVideo] = useState(null)
-  // video = { title, sizeBytes, uploadedAt, url }
+  const [loading, setLoading] = useState(true)
+  const { isAuthenticated, checking } = useAuth()
 
-  const setCurrentVideo = (file) => {
-    const url = URL.createObjectURL(file)
-    setVideo({
-      title: file.name.replace(/\.[^/.]+$/, ''),
-      sizeBytes: file.size,
-      uploadedAt: new Date(),
-      url,
-    })
+  const setCurrentVideo = (currentVideo) => {
+    setVideo(currentVideo)
   }
 
-  const clearVideo = () => {
-    if (video?.url) URL.revokeObjectURL(video.url)
+  const refreshCurrentVideo = async () => {
+    if (!isAuthenticated) {
+      setVideo(null)
+      setLoading(false)
+      return null
+    }
+
+    setLoading(true)
+    try {
+      const result = await apiGetCurrentVideo()
+      const current = result.video
+      if (!current) {
+        setVideo(null)
+        return null
+      }
+      setVideo({
+        id: current.id,
+        title: current.title,
+        originalFilename: current.original_filename,
+        sizeBytes: current.size_bytes,
+        uploadedAt: current.uploaded_at,
+        url: current.playback_url,
+        playbackUrl: current.playback_url,
+        processingStatus: current.processing_status,
+        videoCodec: current.video_codec,
+        audioCodec: current.audio_codec,
+        container: current.container,
+        width: current.width,
+        height: current.height,
+        duration: current.duration,
+        hasAudio: current.has_audio,
+      })
+      return current
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (checking) return
+    refreshCurrentVideo().catch(() => {
+      setVideo(null)
+      setLoading(false)
+    })
+  }, [checking, isAuthenticated])
+
+  const clearVideo = async () => {
+    await apiDeleteCurrentVideo()
     setVideo(null)
   }
 
   return (
-    <VideoContext.Provider value={{ video, setCurrentVideo, clearVideo }}>
+    <VideoContext.Provider value={{ video, loading, refreshCurrentVideo, clearVideo, setCurrentVideo }}>
       {children}
     </VideoContext.Provider>
   )

@@ -1,13 +1,13 @@
 import { RefreshCw, Trash2 } from 'lucide-react'
-import { formatBytes, formatDate } from '../utils/mockApi.js'
+import { formatBytes, formatDate } from '../utils/api.js'
 
 export default function VideoPlayer({ video, onReplace, onDelete }) {
   return (
     <div className="animate-rise">
       <div className="relative rounded-2xl overflow-hidden border border-stage-700 shadow-glow bg-black">
         <video
-          key={video.url}
-          src={video.url}
+          key={video.playbackUrl}
+          src={video.playbackUrl}
           controls
           className="w-full aspect-video bg-black"
         />

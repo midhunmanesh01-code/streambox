@@ -1,1 +1,11 @@
 node_modules/
+dist/
+.env
+.env.*
+backend/.env
+backend/.env.*
+backend/data/
+backend/.venv/
+backend/venv/
+backend/__pycache__/
+backend/**/*.pyc

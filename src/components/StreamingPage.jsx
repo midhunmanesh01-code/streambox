@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { UploadCloud } from 'lucide-react'
+import { Loader2, UploadCloud } from 'lucide-react'
 import Header from './Header.jsx'
 import EmptyState from './EmptyState.jsx'
 import VideoPlayer from './VideoPlayer.jsx'
@@ -9,14 +9,14 @@ import ReplaceConfirmationModal from './ReplaceConfirmationModal.jsx'
 import { useVideo } from '../context/VideoContext.jsx'
 
 export default function StreamingPage() {
-  const { video, setCurrentVideo, clearVideo } = useVideo()
+  const { video, loading, setCurrentVideo, refreshCurrentVideo, clearVideo } = useVideo()
 
   const [uploaderOpen, setUploaderOpen] = useState(false)
   const [pendingReplace, setPendingReplace] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
 
-  const handleUploadComplete = (file) => {
-    setCurrentVideo(file)
+  const handleUploadComplete = (uploadedVideo) => {
+    setCurrentVideo(uploadedVideo)
     setUploaderOpen(false)
     setPendingReplace(false)
   }
@@ -28,29 +28,59 @@ export default function StreamingPage() {
   }
 
   const handleDeleteClick = () => setDeleteOpen(true)
-  const handleConfirmDelete = () => {
-    clearVideo()
+  const handleConfirmDelete = async () => {
+    await clearVideo()
     setDeleteOpen(false)
   }
+
+  const currentVideoIsReady = video?.processingStatus === 'ready'
+  const currentVideoIsProcessing = video && !currentVideoIsReady
 
   return (
     <div className="min-h-screen bg-stage-950">
       <Header />
 
       <main className="max-w-6xl mx-auto px-6 py-10 md:py-14">
-        {!video && !uploaderOpen && <EmptyState onUploadClick={() => setUploaderOpen(true)} />}
+        {loading && (
+          <div className="min-h-[50vh] flex items-center justify-center text-ink-500">
+            <Loader2 className="w-5 h-5 animate-spin" />
+          </div>
+        )}
 
-        {!video && uploaderOpen && (
+        {!loading && currentVideoIsProcessing && !uploaderOpen && (
+          <div className="max-w-2xl mx-auto rounded-2xl border border-stage-700 bg-stage-900/60 px-6 py-12 text-center animate-rise">
+            <div className="mx-auto mb-4 w-11 h-11 rounded-full border border-stage-600 flex items-center justify-center">
+              <Loader2 className="w-5 h-5 animate-spin text-brass-400" />
+            </div>
+            <h2 className="font-display text-2xl text-ink-100 mb-2">Preparing video for playback…</h2>
+            <p className="text-ink-500 text-sm max-w-md mx-auto">
+              StreamBox is analyzing the upload and generating a browser-compatible playback version.
+            </p>
+          </div>
+        )}
+
+        {!loading && video?.processingStatus === 'failed' && !uploaderOpen && (
+          <div className="max-w-2xl mx-auto rounded-2xl border border-signal-red/30 bg-signal-red/10 px-6 py-12 text-center animate-rise">
+            <h2 className="font-display text-2xl text-ink-100 mb-2">Video processing failed</h2>
+            <p className="text-ink-500 text-sm max-w-md mx-auto">
+              StreamBox could not prepare this file for browser playback. Upload a different video to try again.
+            </p>
+          </div>
+        )}
+
+        {!loading && !video && !uploaderOpen && <EmptyState onUploadClick={() => setUploaderOpen(true)} />}
+
+        {!loading && !video && uploaderOpen && (
           <div className="max-w-2xl mx-auto">
             <VideoUploader onUploadComplete={handleUploadComplete} autoOpen />
           </div>
         )}
 
-        {video && !uploaderOpen && (
+        {!loading && currentVideoIsReady && !uploaderOpen && (
           <VideoPlayer video={video} onReplace={handleReplaceClick} onDelete={handleDeleteClick} />
         )}
 
-        {video && uploaderOpen && (
+        {!loading && video && uploaderOpen && (
           <div className="max-w-2xl mx-auto">
             <VideoUploader onUploadComplete={handleUploadComplete} autoOpen />
             <button
@@ -62,7 +92,7 @@ export default function StreamingPage() {
           </div>
         )}
 
-        {video && !uploaderOpen && (
+        {!loading && currentVideoIsReady && !uploaderOpen && (
           <div className="mt-10 flex justify-center">
             <button
               onClick={handleReplaceClick}

@@ -1,43 +1,51 @@
 import { createContext, useContext, useEffect, useState } from 'react'
+import { apiAuthStatus, apiLogin, apiLogout } from '../utils/api.js'
 
 const AuthContext = createContext(null)
-
-const SESSION_KEY = 'reel_session'
-
-// TEMPORARY frontend-only credential check.
-// Replace `mockLogin` with a real call to POST /api/auth/login when the
-// Flask backend is ready. Keep the same function signature so nothing
-// else in the app has to change.
-async function mockLogin(username, password) {
-  await new Promise((resolve) => setTimeout(resolve, 500))
-  if (username === 'admin' && password === '123') {
-    return { ok: true, token: 'mock-session-token' }
-  }
-  return { ok: false, error: 'Incorrect username or password.' }
-}
 
 export function AuthProvider({ children }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [checking, setChecking] = useState(true)
 
   useEffect(() => {
-    const existing = sessionStorage.getItem(SESSION_KEY)
-    setIsAuthenticated(existing === 'mock-session-token')
-    setChecking(false)
+    let active = true
+
+    const bootstrap = async () => {
+      try {
+        const result = await apiAuthStatus()
+        if (!active) return
+        setIsAuthenticated(Boolean(result.authenticated))
+      } catch {
+        if (!active) return
+        setIsAuthenticated(false)
+      } finally {
+        if (active) setChecking(false)
+      }
+    }
+
+    bootstrap()
+    return () => {
+      active = false
+    }
   }, [])
 
   const login = async (username, password) => {
-    const result = await mockLogin(username, password)
-    if (result.ok) {
-      sessionStorage.setItem(SESSION_KEY, result.token)
+    try {
+      const result = await apiLogin(username, password)
       setIsAuthenticated(true)
+      return result
+    } catch (error) {
+      setIsAuthenticated(false)
+      return { ok: false, error: error.message || 'Incorrect username or password.' }
     }
-    return result
   }
 
-  const logout = () => {
-    sessionStorage.removeItem(SESSION_KEY)
-    setIsAuthenticated(false)
+  const logout = async () => {
+    try {
+      await apiLogout()
+    } finally {
+      setIsAuthenticated(false)
+    }
   }
 
   return (
