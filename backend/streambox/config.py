@@ -18,6 +18,12 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_STORAGE_DIR = Path(os.getenv('STREAMBOX_STORAGE_DIR', DATA_DIR / 'storage'))
 LOCAL_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
+B2_KEY_ID = os.getenv('B2_KEY_ID')
+B2_APPLICATION_KEY = os.getenv('B2_APPLICATION_KEY')
+B2_BUCKET_NAME = os.getenv('B2_BUCKET_NAME')
+B2_ENDPOINT = os.getenv('B2_ENDPOINT')
+B2_REGION = os.getenv('B2_REGION')
+
 SECRET_KEY = os.getenv('SECRET_KEY', 'dev-streambox-secret-key-change-me')
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD_HASH = os.getenv('ADMIN_PASSWORD_HASH', '')

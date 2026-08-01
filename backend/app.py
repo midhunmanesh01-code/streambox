@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from flask import redirect
 from flask import Flask, jsonify, request, send_file, session
 from flask_cors import CORS
 from werkzeug.security import check_password_hash
@@ -143,11 +144,16 @@ def _finalize_new_video(video_id: str):
             return
 
         try:
-            original_path = storage.path_for_key(row['original_storage_key'])
+            original_path = storage.read_path(row['original_storage_key'])
             probe = probe_media(original_path)
 
             playback_path = storage.path_for_key(row['playback_storage_key'])
             transcode_for_browser(original_path, playback_path, probe)
+            storage.copy_path(playback_path, row['playback_storage_key'])
+
+            if STORAGE_BACKEND == 'b2':
+                original_path.unlink(missing_ok=True)
+                playback_path.unlink(missing_ok=True)
 
             previous_current = _get_current_ready_video(connection)
 
@@ -400,6 +406,11 @@ def playback(token: str):
     parsed = _parse_signed_token(token)
     if not parsed:
         return _json_error('Invalid or expired playback URL.', 403)
+
+    if STORAGE_BACKEND == 'b2':
+        if not storage.exists(parsed['storage_key']):
+            return _json_error('Playback file not found.', 404)
+        return redirect(storage.presigned_get_url(parsed['storage_key'], SIGNED_URL_TTL_SECONDS), code=302)
 
     path = storage.path_for_key(parsed['storage_key'])
     if not path.exists():
