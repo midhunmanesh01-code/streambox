@@ -397,10 +397,6 @@ def delete_video():
 
 @app.get('/api/video/playback/<path:token>')
 def playback(token: str):
-    error = _require_auth()
-    if error:
-        return error
-
     parsed = _parse_signed_token(token)
     if not parsed:
         return _json_error('Invalid or expired playback URL.', 403)

@@ -72,47 +72,24 @@ def probe_media(file_path: Path) -> MediaProbe:
     )
 
 
-def playback_needs_video_transcode(probe: MediaProbe) -> bool:
-    return not (
-        probe.video_codec == 'h264'
-        and probe.pix_fmt == 'yuv420p'
-    )
-
-
-def playback_needs_audio_transcode(probe: MediaProbe) -> bool:
-    if not probe.has_audio:
-        return False
-    if probe.audio_codec != 'aac':
-        return True
-    if probe.channels is not None and probe.channels > 2:
-        return True
-    return False
-
-
 def build_ffmpeg_command(input_path: Path, output_path: Path, probe: MediaProbe) -> list[str]:
     command = ['ffmpeg', '-y', '-i', str(input_path)]
 
-    if playback_needs_video_transcode(probe):
-        command.extend([
-            '-c:v', 'libx264',
-            '-pix_fmt', 'yuv420p',
-            '-preset', 'veryfast',
-            '-crf', '22',
-        ])
-    else:
-        command.extend(['-c:v', 'copy'])
+    command.extend([
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-preset', 'veryfast',
+        '-crf', '22',
+    ])
 
     if probe.has_audio:
-        if playback_needs_audio_transcode(probe) or playback_needs_video_transcode(probe):
-            command.extend([
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-ac', '2',
-            ])
-        else:
-            command.extend(['-c:a', 'copy'])
+        command.extend([
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-ac', '2',
+        ])
     else:
-        command.append('-an')
+        command.extend(['-an'])
 
     command.extend([
         '-movflags', '+faststart',
