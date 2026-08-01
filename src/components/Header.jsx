@@ -16,7 +16,7 @@ export default function Header() {
       <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <Film className="w-4 h-4 text-brass-400" strokeWidth={1.5} />
-          <span className="font-display text-lg tracking-marquee uppercase text-ink-100">Reel</span>
+          <span className="font-display text-lg tracking-marquee uppercase text-ink-100">StreamBox</span>
         </div>
         <button
           onClick={handleLogout}

@@ -40,8 +40,8 @@ export default function Login() {
           <div className="w-11 h-11 rounded-full border border-brass-400/40 flex items-center justify-center mb-5">
             <Film className="w-5 h-5 text-brass-400" strokeWidth={1.5} />
           </div>
-          <h1 className="font-display text-2xl text-ink-100 tracking-marquee uppercase">Reel</h1>
-          <p className="mt-2 text-xs text-ink-500 tracking-[0.2em] uppercase">Private Screening Room</p>
+          <h1 className="font-display text-2xl text-ink-100 tracking-marquee uppercase">StreamBox</h1>
+          <p className="mt-2 text-xs text-ink-500 tracking-[0.2em] uppercase">Private Streaming Room</p>
         </div>
 
         <form
@@ -60,7 +60,7 @@ export default function Login() {
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 className="w-full bg-stage-900 border border-stage-600 rounded-lg px-4 py-2.5 text-ink-100 placeholder:text-ink-500/60 outline-none focus:border-brass-400/70 transition-colors"
-                placeholder="admin"
+                placeholder="username"
                 required
               />
             </div>
@@ -109,7 +109,7 @@ export default function Login() {
         </form>
 
         <p className="text-center text-xs text-ink-500 mt-6">
-          Prototype credentials — admin / 123
+          With ❤️-By Midhun Manesh
         </p>
       </div>
     </div>
