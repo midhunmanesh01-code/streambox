@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState } from 'react'
-import { apiDeleteCurrentVideo, apiGetCurrentVideo } from '../utils/api.js'
+import { apiDeleteCurrentVideo, apiGetCurrentVideo ,resolveApiUrl } from '../utils/api.js'
 import { useAuth } from './AuthContext.jsx'
 
 const VideoContext = createContext(null)
@@ -34,8 +34,8 @@ export function VideoProvider({ children }) {
         originalFilename: current.original_filename,
         sizeBytes: current.size_bytes,
         uploadedAt: current.uploaded_at,
-        url: current.playback_url,
-        playbackUrl: current.playback_url,
+        url: resolveApiUrl(current.playback_url),
+        playbackUrl: resolveApiUrl(current.playback_url),
         processingStatus: current.processing_status,
         videoCodec: current.video_codec,
         audioCodec: current.audio_codec,

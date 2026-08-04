@@ -10,5 +10,6 @@ export {
   apiUploadFile,
   formatBytes,
   formatDate,
+  resolveApiUrl,
   waitForVideoReady,
 } from './api.js'

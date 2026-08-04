@@ -6,6 +6,12 @@ function joinUrl(path) {
   return `${API_BASE}${path}`
 }
 
+export function resolveApiUrl(path) {
+  if (!path) return null
+  if (/^https?:\/\//i.test(path)) return path
+  return joinUrl(path)
+}
+
 async function parseJsonResponse(response) {
   const data = await response.json().catch(() => null)
   if (!response.ok) {
@@ -150,3 +156,4 @@ export async function waitForVideoReady(uploadSessionId, { intervalMs = 2000, ti
   }
   throw new Error('Video processing is taking longer than expected.')
 }
+
