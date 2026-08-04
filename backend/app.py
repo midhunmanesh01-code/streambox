@@ -137,10 +137,23 @@ def _delete_video_assets(video_row):
         if storage_key:
             storage.delete(storage_key)
 
+def _is_browser_compatible(probe) -> bool:
+    containers = set((probe.container or '').lower().split(','))
+
+    return (
+        'mp4' in containers
+        and probe.video_codec == 'h264'
+        and (not probe.has_audio or probe.audio_codec == 'aac')
+        and probe.pix_fmt in ('yuv420p', 'yuvj420p')
+    )
 
 def _finalize_new_video(video_id: str):
     with get_db() as connection:
-        row = connection.execute('SELECT * FROM videos WHERE id = ?', (video_id,)).fetchone()
+        row = connection.execute(
+            'SELECT * FROM videos WHERE id = ?',
+            (video_id,)
+        ).fetchone()
+
         if not row or row['processing_status'] != 'processing':
             return
 
@@ -151,25 +164,79 @@ def _finalize_new_video(video_id: str):
             app.logger.warning("PROCESS: source downloaded %s", video_id)
 
             probe = probe_media(original_path)
-            app.logger.warning("PROCESS: probe completed %s", video_id)
+            app.logger.warning(
+                "PROCESS: probe completed %s - video=%s audio=%s container=%s",
+                video_id,
+                probe.video_codec,
+                probe.audio_codec,
+                probe.container,
+            )
 
-            playback_path = storage.path_for_key(row['playback_storage_key'])
-            app.logger.warning("PROCESS: starting transcode %s", video_id)
+            # Already browser/TV friendly — don't waste CPU transcoding it.
+            if _is_browser_compatible(probe):
+                app.logger.warning(
+                    "PROCESS: compatible source detected, skipping transcode %s",
+                    video_id,
+                )
 
-            transcode_for_browser(original_path, playback_path, probe)
-            app.logger.warning("PROCESS: transcode completed %s", video_id)
+                playback_storage_key = row['original_storage_key']
 
-            storage.copy_path(playback_path, row['playback_storage_key'])
-            app.logger.warning("PROCESS: playback uploaded %s", video_id)
+            else:
+                app.logger.warning(
+                    "PROCESS: incompatible source, starting transcode %s",
+                    video_id,
+                )
+
+                playback_path = storage.path_for_key(
+                    row['playback_storage_key']
+                )
+
+                transcode_for_browser(
+                    original_path,
+                    playback_path,
+                    probe,
+                )
+
+                app.logger.warning(
+                    "PROCESS: transcode completed %s",
+                    video_id,
+                )
+
+                storage.copy_path(
+                    playback_path,
+                    row['playback_storage_key'],
+                )
+
+                app.logger.warning(
+                    "PROCESS: playback uploaded %s",
+                    video_id,
+                )
+
+                playback_storage_key = row['playback_storage_key']
+
+                if STORAGE_BACKEND == 'b2':
+                    playback_path.unlink(missing_ok=True)
 
             if STORAGE_BACKEND == 'b2':
                 original_path.unlink(missing_ok=True)
-                playback_path.unlink(missing_ok=True)
 
             previous_current = _get_current_ready_video(connection)
 
             connection.execute(
-                'UPDATE videos SET processing_status = ?, video_codec = ?, audio_codec = ?, container = ?, width = ?, height = ?, duration = ?, has_audio = ?, playback_mime_type = ? WHERE id = ?',
+                '''
+                UPDATE videos
+                SET processing_status = ?,
+                    video_codec = ?,
+                    audio_codec = ?,
+                    container = ?,
+                    width = ?,
+                    height = ?,
+                    duration = ?,
+                    has_audio = ?,
+                    playback_mime_type = ?,
+                    playback_storage_key = ?
+                WHERE id = ?
+                ''',
                 (
                     'ready',
                     probe.video_codec,
@@ -180,25 +247,50 @@ def _finalize_new_video(video_id: str):
                     probe.duration,
                     1 if probe.has_audio else 0,
                     'video/mp4',
+                    playback_storage_key,
                     video_id,
                 ),
             )
-            connection.execute('UPDATE videos SET is_current = 0 WHERE id != ?', (video_id,))
-            connection.execute('UPDATE videos SET is_current = 1 WHERE id = ?', (video_id,))
+
+            connection.execute(
+                'UPDATE videos SET is_current = 0 WHERE id != ?',
+                (video_id,),
+            )
+
+            connection.execute(
+                'UPDATE videos SET is_current = 1 WHERE id = ?',
+                (video_id,),
+            )
 
             if previous_current and previous_current['id'] != video_id:
                 _delete_video_assets(previous_current)
-                connection.execute('DELETE FROM videos WHERE id = ?', (previous_current['id'],))
+                connection.execute(
+                    'DELETE FROM videos WHERE id = ?',
+                    (previous_current['id'],),
+                )
 
         except (MediaValidationError, MediaProcessingError) as exc:
             connection.execute(
-                'UPDATE videos SET processing_status = ?, error_message = ? WHERE id = ?',
+                '''
+                UPDATE videos
+                SET processing_status = ?, error_message = ?
+                WHERE id = ?
+                ''',
                 ('failed', str(exc), video_id),
             )
+
         except Exception as exc:
-            app.logger.exception("Video processing failed for %s", video_id)
+            app.logger.exception(
+                "Video processing failed for %s",
+                video_id,
+            )
+
             connection.execute(
-                'UPDATE videos SET processing_status = ?, error_message = ? WHERE id = ?',
+                '''
+                UPDATE videos
+                SET processing_status = ?, error_message = ?
+                WHERE id = ?
+                ''',
                 ('failed', str(exc), video_id),
             )
 
