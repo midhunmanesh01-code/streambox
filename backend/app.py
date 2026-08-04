@@ -44,6 +44,7 @@ app.config.update(
 CORS(app, supports_credentials=True, origins=[API_ALLOWED_ORIGIN])
 
 storage = get_storage_backend()
+init_db()
 
 
 def _json_error(message: str, status_code: int):
