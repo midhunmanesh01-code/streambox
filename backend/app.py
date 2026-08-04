@@ -145,12 +145,22 @@ def _finalize_new_video(video_id: str):
             return
 
         try:
+            app.logger.warning("PROCESS: starting video %s", video_id)
+
             original_path = storage.read_path(row['original_storage_key'])
+            app.logger.warning("PROCESS: source downloaded %s", video_id)
+
             probe = probe_media(original_path)
+            app.logger.warning("PROCESS: probe completed %s", video_id)
 
             playback_path = storage.path_for_key(row['playback_storage_key'])
+            app.logger.warning("PROCESS: starting transcode %s", video_id)
+
             transcode_for_browser(original_path, playback_path, probe)
+            app.logger.warning("PROCESS: transcode completed %s", video_id)
+
             storage.copy_path(playback_path, row['playback_storage_key'])
+            app.logger.warning("PROCESS: playback uploaded %s", video_id)
 
             if STORAGE_BACKEND == 'b2':
                 original_path.unlink(missing_ok=True)
