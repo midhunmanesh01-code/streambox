@@ -185,10 +185,11 @@ def _finalize_new_video(video_id: str):
                 'UPDATE videos SET processing_status = ?, error_message = ? WHERE id = ?',
                 ('failed', str(exc), video_id),
             )
-        except Exception:
+        except Exception as exc:
+            app.logger.exception("Video processing failed for %s", video_id)
             connection.execute(
                 'UPDATE videos SET processing_status = ?, error_message = ? WHERE id = ?',
-                ('failed', 'Video processing failed.', video_id),
+                ('failed', str(exc), video_id),
             )
 
 
