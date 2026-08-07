@@ -176,18 +176,28 @@ def _multipart_session_error(upload_session):
 
 
 def _create_video_from_upload_session(upload_session) -> bool:
+    is_b2 = _is_b2_storage()
+    playback_key = upload_session['original_storage_key'] if is_b2 else upload_session['playback_storage_key']
+    status = 'ready' if is_b2 else 'processing'
+    is_current = 1 if is_b2 else 0
+
     with get_db() as connection:
         existing = connection.execute('SELECT 1 FROM videos WHERE id = ?', (upload_session['video_id'],)).fetchone()
         if existing:
             return False
+        if is_b2:
+            connection.execute('UPDATE videos SET is_current = 0')
         connection.execute(
             'INSERT INTO videos (id, title, original_filename, original_storage_key, playback_storage_key, size_bytes, uploaded_at, processing_status, video_codec, audio_codec, container, width, height, duration, has_audio, playback_mime_type, is_current, uploaded_source_key, previous_video_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (upload_session['video_id'], _sanitize_title(upload_session['original_filename']), upload_session['original_filename'], upload_session['original_storage_key'], upload_session['playback_storage_key'], upload_session['size_bytes'], utcnow_iso(), 'processing', None, None, None, None, None, None, 0, 'video/mp4', 0, upload_session['temporary_storage_key'], None),
+            (upload_session['video_id'], _sanitize_title(upload_session['original_filename']), upload_session['original_filename'], upload_session['original_storage_key'], playback_key, upload_session['size_bytes'], utcnow_iso(), status, None, None, None, None, None, None, 0, 'video/mp4', is_current, upload_session['temporary_storage_key'], None),
         )
         connection.execute(
             'UPDATE upload_sessions SET status = ?, uploaded_at = ?, completed_at = ? WHERE id = ? AND status = ?',
             ('uploaded', utcnow_iso(), utcnow_iso(), upload_session['id'], 'completing'),
         )
+        if is_b2:
+            row = connection.execute('SELECT * FROM videos WHERE id = ?', (upload_session['video_id'],)).fetchone()
+            _write_current_video_manifest(row)
         return True
 
 
@@ -852,7 +862,7 @@ def complete_multipart_upload(upload_session_id: str):
         app.logger.exception('Failed to persist completed B2 upload')
         _mark_multipart_session_aborted(upload_session_id, 'Completed B2 upload could not be persisted.')
         return _json_error('Could not finalize multipart upload.', 500)
-    if created:
+    if created and not _is_b2_storage():
         _launch_processing(upload_session['video_id'])
     return jsonify({'ok': True, 'video_id': upload_session['video_id']})
 
@@ -939,8 +949,6 @@ def playback(token: str):
         return _json_error('Invalid or expired playback URL.', 403)
 
     if STORAGE_BACKEND == 'b2':
-        if not storage.exists(parsed['storage_key']):
-            return _json_error('Playback file not found.', 404)
         return redirect(storage.presigned_get_url(parsed['storage_key'], SIGNED_URL_TTL_SECONDS), code=302)
 
     path = storage.path_for_key(parsed['storage_key'])
