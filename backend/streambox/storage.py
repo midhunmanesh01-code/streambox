@@ -44,6 +44,24 @@ class StorageBackend(ABC):
     def presigned_get_url(self, storage_key: str, expires_in: int) -> str:
         raise NotImplementedError
 
+    def create_multipart_upload(self, storage_key: str, content_type: str | None) -> str:
+        raise NotImplementedError
+
+    def presigned_upload_part_url(self, storage_key: str, upload_id: str, part_number: int, expires_in: int) -> str:
+        raise NotImplementedError
+
+    def list_multipart_parts(self, storage_key: str, upload_id: str) -> list[dict]:
+        raise NotImplementedError
+
+    def complete_multipart_upload(self, storage_key: str, upload_id: str, parts: list[dict]) -> None:
+        raise NotImplementedError
+
+    def abort_multipart_upload(self, storage_key: str, upload_id: str) -> None:
+        raise NotImplementedError
+
+    def object_size(self, storage_key: str) -> int:
+        raise NotImplementedError
+
 
 class LocalStorageBackend(StorageBackend):
     def __init__(self, root_dir: Path | str = LOCAL_STORAGE_DIR):
@@ -202,6 +220,43 @@ class BackblazeB2StorageBackend(StorageBackend):
             Params={'Bucket': self._bucket_name, 'Key': storage_key},
             ExpiresIn=expires_in,
         )
+
+    def create_multipart_upload(self, storage_key: str, content_type: str | None) -> str:
+        kwargs = {'Bucket': self._bucket_name, 'Key': storage_key}
+        if content_type:
+            kwargs['ContentType'] = content_type
+        return self._client.create_multipart_upload(**kwargs)['UploadId']
+
+    def presigned_upload_part_url(self, storage_key: str, upload_id: str, part_number: int, expires_in: int) -> str:
+        return self._client.generate_presigned_url(
+            'upload_part',
+            Params={'Bucket': self._bucket_name, 'Key': storage_key, 'UploadId': upload_id, 'PartNumber': part_number},
+            ExpiresIn=expires_in,
+            HttpMethod='PUT',
+        )
+
+    def list_multipart_parts(self, storage_key: str, upload_id: str) -> list[dict]:
+        parts = []
+        marker = 0
+        while True:
+            response = self._client.list_parts(
+                Bucket=self._bucket_name, Key=storage_key, UploadId=upload_id, PartNumberMarker=marker,
+            )
+            parts.extend(response.get('Parts', []))
+            if not response.get('IsTruncated'):
+                return parts
+            marker = response.get('NextPartNumberMarker', 0)
+
+    def complete_multipart_upload(self, storage_key: str, upload_id: str, parts: list[dict]) -> None:
+        self._client.complete_multipart_upload(
+            Bucket=self._bucket_name, Key=storage_key, UploadId=upload_id, MultipartUpload={'Parts': parts},
+        )
+
+    def abort_multipart_upload(self, storage_key: str, upload_id: str) -> None:
+        self._client.abort_multipart_upload(Bucket=self._bucket_name, Key=storage_key, UploadId=upload_id)
+
+    def object_size(self, storage_key: str) -> int:
+        return int(self._client.head_object(Bucket=self._bucket_name, Key=storage_key)['ContentLength'])
 
 
 def get_storage_backend() -> StorageBackend:

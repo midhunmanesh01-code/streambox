@@ -38,5 +38,9 @@ SESSION_COOKIE_NAME = os.getenv('SESSION_COOKIE_NAME', 'streambox_session')
 MAX_UPLOAD_BYTES = int(1.5 * 1024 * 1024 * 1024)
 UPLOAD_SESSION_TTL_SECONDS = int(os.getenv('UPLOAD_SESSION_TTL_SECONDS', str(60 * 60)))
 SIGNED_URL_TTL_SECONDS = int(os.getenv('SIGNED_URL_TTL_SECONDS', str(15 * 60)))
+B2_MULTIPART_PART_SIZE_BYTES = 16 * 1024 * 1024
+# URLs are intentionally short-lived even if an environment value is set too high.
+B2_MULTIPART_URL_TTL_SECONDS = max(1, min(int(os.getenv('B2_MULTIPART_URL_TTL_SECONDS', str(15 * 60))), 60 * 60))
+B2_MULTIPART_URL_BATCH_SIZE = 10
 
 STORAGE_BACKEND = os.getenv('STORAGE_BACKEND', 'local').lower()

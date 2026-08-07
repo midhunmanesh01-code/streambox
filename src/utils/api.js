@@ -124,6 +124,127 @@ export function apiUploadFile(uploadUrl, file, { onProgress } = {}) {
   }
 }
 
+async function apiMultipartPartUrls(uploadSessionId, partNumbers) {
+  const response = await fetch(joinUrl(`/api/video/upload/multipart/${uploadSessionId}/parts`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ part_numbers: partNumbers }),
+  })
+  return parseJsonResponse(response)
+}
+
+export async function apiCompleteMultipartUpload(uploadSessionId) {
+  const response = await fetch(joinUrl(`/api/video/upload/multipart/${uploadSessionId}/complete`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+  })
+  return parseJsonResponse(response)
+}
+
+export async function apiAbortMultipartUpload(uploadSessionId) {
+  const response = await fetch(joinUrl(`/api/video/upload/multipart/${uploadSessionId}/abort`), {
+    method: 'POST',
+    credentials: 'include',
+  })
+  return parseJsonResponse(response)
+}
+
+function uploadPart(url, blob, onProgress, activeRequests) {
+  const xhr = new XMLHttpRequest()
+  const promise = new Promise((resolve, reject) => {
+    xhr.open('PUT', url)
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(event.loaded)
+    }
+    xhr.onerror = () => reject(new Error('Part upload failed.'))
+    xhr.onabort = () => reject(new Error('Upload canceled.'))
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve()
+      else reject(new Error(`Part upload failed (${xhr.status}).`))
+    }
+    xhr.send(blob)
+  })
+  activeRequests.add(xhr)
+  return promise.finally(() => activeRequests.delete(xhr))
+}
+
+// Direct-to-B2 uploads deliberately use a small worker pool. Progress includes
+// completed parts plus bytes currently sent by all active parts.
+export function apiUploadMultipart(uploadSession, file, { onProgress } = {}) {
+  const activeRequests = new Set()
+  const activeBytes = new Map()
+  let completedBytes = 0
+  let canceled = false
+  const partSize = uploadSession.part_size_bytes
+  const partCount = uploadSession.part_count
+
+  const reportProgress = () => {
+    const inFlight = [...activeBytes.values()].reduce((total, bytes) => total + bytes, 0)
+    onProgress?.(Math.min(file.size, completedBytes + inFlight), file.size)
+  }
+
+  const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+  const uploadOnePart = async (partNumber) => {
+    const start = (partNumber - 1) * partSize
+    const blob = file.slice(start, Math.min(file.size, start + partSize))
+    let lastError
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (canceled) throw new Error('Upload canceled.')
+      activeBytes.set(partNumber, 0)
+      reportProgress()
+      try {
+        const urlResult = await apiMultipartPartUrls(uploadSession.upload_session_id, [partNumber])
+        await uploadPart(urlResult.parts[0].url, blob, (loaded) => {
+          activeBytes.set(partNumber, loaded)
+          reportProgress()
+        }, activeRequests)
+        activeBytes.delete(partNumber)
+        completedBytes += blob.size
+        reportProgress()
+        return
+      } catch (error) {
+        lastError = error
+        activeBytes.delete(partNumber)
+        reportProgress()
+        if (canceled) throw new Error('Upload canceled.')
+        if (attempt < 3) await wait(500 * (2 ** attempt))
+      }
+    }
+    throw lastError || new Error('Part upload failed.')
+  }
+
+  const promise = (async () => {
+    let nextPart = 1
+    const worker = async () => {
+      while (!canceled) {
+        const partNumber = nextPart
+        nextPart += 1
+        if (partNumber > partCount) return
+        await uploadOnePart(partNumber)
+      }
+    }
+    try {
+      await Promise.all(Array.from({ length: Math.min(3, partCount) }, worker))
+      if (canceled) throw new Error('Upload canceled.')
+      return apiCompleteMultipartUpload(uploadSession.upload_session_id)
+    } catch (error) {
+      if (!canceled) apiAbortMultipartUpload(uploadSession.upload_session_id).catch(() => {})
+      throw error
+    }
+  })()
+
+  return {
+    promise,
+    cancel: () => {
+      canceled = true
+      activeRequests.forEach((xhr) => xhr.abort())
+      apiAbortMultipartUpload(uploadSession.upload_session_id).catch(() => {})
+    },
+  }
+}
+
 export async function apiCompleteUpload(uploadSessionId) {
   const response = await fetch(joinUrl('/api/video/upload/complete'), {
     method: 'POST',

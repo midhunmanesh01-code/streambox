@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
     created_at TEXT NOT NULL,
     uploaded_at TEXT,
     completed_at TEXT,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    multipart_upload_id TEXT,
+    multipart_part_size INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS videos (
@@ -73,6 +75,15 @@ def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     with get_db() as connection:
         connection.executescript(SCHEMA)
+        # Existing installations predate direct B2 multipart uploads. SQLite has
+        # no ADD COLUMN IF NOT EXISTS, so make this migration explicitly idempotent.
+        columns = {row['name'] for row in connection.execute('PRAGMA table_info(upload_sessions)')}
+        for name, definition in (
+            ('multipart_upload_id', 'TEXT'),
+            ('multipart_part_size', 'INTEGER'),
+        ):
+            if name not in columns:
+                connection.execute(f'ALTER TABLE upload_sessions ADD COLUMN {name} {definition}')
 
 
 def utcnow_iso() -> str:

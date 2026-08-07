@@ -4,6 +4,7 @@ import UploadProgress from './UploadProgress.jsx'
 import {
   MAX_UPLOAD_BYTES,
   apiInitUpload,
+  apiUploadMultipart,
   apiUploadFile,
   formatBytes,
   waitForVideoReady,
@@ -12,6 +13,7 @@ import {
 export default function VideoUploader({ onUploadComplete, autoOpen }) {
   const inputRef = useRef(null)
   const controllerRef = useRef(null)
+  const canceledRef = useRef(false)
 
   const [isDragging, setIsDragging] = useState(false)
   const [file, setFile] = useState(null)
@@ -35,10 +37,18 @@ export default function VideoUploader({ onUploadComplete, autoOpen }) {
     setPercent(0)
     setUploadedBytes(0)
     setError('')
+    canceledRef.current = false
 
     try {
       const uploadSession = await apiInitUpload(selected)
-      const upload = apiUploadFile(uploadSession.upload_url, selected, {
+      const upload = uploadSession.upload_mode === 'b2_multipart'
+        ? apiUploadMultipart(uploadSession, selected, {
+          onProgress: (uploaded, total) => {
+            setPercent(Math.round((uploaded / total) * 100))
+            setUploadedBytes(uploaded)
+          },
+        })
+        : apiUploadFile(uploadSession.upload_url, selected, {
         onProgress: (uploaded, total) => {
           setPercent(Math.round((uploaded / total) * 100))
           setUploadedBytes(uploaded)
@@ -55,12 +65,14 @@ export default function VideoUploader({ onUploadComplete, autoOpen }) {
       setStatus('success')
       setTimeout(() => onUploadComplete(readyVideo), 300)
     } catch (uploadError) {
+      if (canceledRef.current) return
       setStatus('error')
       setError(uploadError.message || 'Upload failed.')
     }
   }, [onUploadComplete])
 
   const handleCancel = () => {
+    canceledRef.current = true
     controllerRef.current?.cancel()
     setFile(null)
     setStatus('idle')

@@ -20,6 +20,9 @@ from streambox.config import (
     APP_HOST,
     APP_PORT,
     API_ALLOWED_ORIGIN,
+    B2_MULTIPART_PART_SIZE_BYTES,
+    B2_MULTIPART_URL_BATCH_SIZE,
+    B2_MULTIPART_URL_TTL_SECONDS,
     DEBUG,
     MAX_UPLOAD_BYTES,
     SECRET_KEY,
@@ -148,6 +151,59 @@ def _delete_video_assets(video_row):
 
 def _is_b2_storage() -> bool:
     return STORAGE_BACKEND == 'b2'
+
+
+def _multipart_part_count(upload_session) -> int:
+    part_size = upload_session['multipart_part_size'] or B2_MULTIPART_PART_SIZE_BYTES
+    return (upload_session['size_bytes'] + part_size - 1) // part_size
+
+
+def _multipart_session_error(upload_session):
+    if not upload_session:
+        return _json_error('Upload session not found.', 404)
+    if not upload_session['multipart_upload_id']:
+        return _json_error('This upload does not use B2 multipart upload.', 409)
+    if upload_session['status'] != 'uploading':
+        return _json_error('Upload session is no longer accepting data.', 409)
+    try:
+        expired = datetime.fromisoformat(upload_session['expires_at']) < _now()
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
+        return _json_error('Upload session has expired.', 410)
+    return None
+
+
+def _create_video_from_upload_session(upload_session) -> bool:
+    with get_db() as connection:
+        existing = connection.execute('SELECT 1 FROM videos WHERE id = ?', (upload_session['video_id'],)).fetchone()
+        if existing:
+            return False
+        connection.execute(
+            'INSERT INTO videos (id, title, original_filename, original_storage_key, playback_storage_key, size_bytes, uploaded_at, processing_status, video_codec, audio_codec, container, width, height, duration, has_audio, playback_mime_type, is_current, uploaded_source_key, previous_video_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (upload_session['video_id'], _sanitize_title(upload_session['original_filename']), upload_session['original_filename'], upload_session['original_storage_key'], upload_session['playback_storage_key'], upload_session['size_bytes'], utcnow_iso(), 'processing', None, None, None, None, None, None, 0, 'video/mp4', 0, upload_session['temporary_storage_key'], None),
+        )
+        connection.execute(
+            'UPDATE upload_sessions SET status = ?, uploaded_at = ?, completed_at = ? WHERE id = ? AND status = ?',
+            ('uploaded', utcnow_iso(), utcnow_iso(), upload_session['id'], 'completing'),
+        )
+        return True
+
+
+def _mark_multipart_session_aborted(upload_session_id: str, message: str) -> None:
+    with get_db() as connection:
+        connection.execute(
+            'UPDATE upload_sessions SET status = ?, error_message = ?, completed_at = ? WHERE id = ? AND status = ?',
+            ('aborted', message, utcnow_iso(), upload_session_id, 'completing'),
+        )
+
+
+def _abort_claimed_multipart_upload(upload_session, message: str) -> None:
+    try:
+        storage.abort_multipart_upload(upload_session['original_storage_key'], upload_session['multipart_upload_id'])
+    except Exception:
+        app.logger.exception('Failed to clean up B2 multipart upload after completion failure')
+    _mark_multipart_session_aborted(upload_session['id'], message)
 
 
 def _invalidate_storage_cache(storage_key: str) -> None:
@@ -503,7 +559,10 @@ def upload_init():
 
     payload = request.get_json(silent=True) or {}
     filename = payload.get('filename', '')
-    size_bytes = int(payload.get('size_bytes') or 0)
+    try:
+        size_bytes = int(payload.get('size_bytes') or 0)
+    except (TypeError, ValueError):
+        return _json_error('A valid file size is required.', 400)
     content_type = payload.get('content_type') or None
 
     if not filename:
@@ -519,24 +578,44 @@ def upload_init():
     original_key = f'videos/{video_id}/source'
     playback_key = f'videos/{video_id}/playback.mp4'
     expires_at = _now() + timedelta(seconds=UPLOAD_SESSION_TTL_SECONDS)
+    multipart_upload_id = None
+    multipart_part_size = None
+    if _is_b2_storage():
+        try:
+            multipart_upload_id = storage.create_multipart_upload(original_key, content_type)
+            multipart_part_size = B2_MULTIPART_PART_SIZE_BYTES
+        except Exception as exc:
+            app.logger.exception('Failed to create B2 multipart upload')
+            return _json_error(f'Could not initialize upload storage: {exc}', 502)
 
-    with get_db() as connection:
-        connection.execute(
-            'INSERT INTO upload_sessions (id, video_id, original_filename, content_type, size_bytes, temporary_storage_key, original_storage_key, playback_storage_key, status, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (
-                upload_session_id,
-                video_id,
-                filename,
-                content_type,
-                size_bytes,
-                temp_key,
-                original_key,
-                playback_key,
-                'uploading',
-                utcnow_iso(),
-                expires_at.isoformat(),
-            ),
-        )
+    try:
+        with get_db() as connection:
+            connection.execute(
+                'INSERT INTO upload_sessions (id, video_id, original_filename, content_type, size_bytes, temporary_storage_key, original_storage_key, playback_storage_key, status, created_at, expires_at, multipart_upload_id, multipart_part_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    upload_session_id,
+                    video_id,
+                    filename,
+                    content_type,
+                    size_bytes,
+                    temp_key,
+                    original_key,
+                    playback_key,
+                    'uploading',
+                    utcnow_iso(),
+                    expires_at.isoformat(),
+                    multipart_upload_id,
+                    multipart_part_size,
+                ),
+            )
+    except Exception:
+        if multipart_upload_id:
+            try:
+                storage.abort_multipart_upload(original_key, multipart_upload_id)
+            except Exception:
+                app.logger.exception('Failed to clean up B2 multipart upload after session persistence failure')
+        app.logger.exception('Failed to persist upload session')
+        return _json_error('Could not initialize upload session.', 500)
 
     return jsonify(
         {
@@ -548,6 +627,9 @@ def upload_init():
             'playback_storage_key': playback_key,
             'expires_at': expires_at.isoformat(),
             'max_bytes': MAX_UPLOAD_BYTES,
+            'upload_mode': 'b2_multipart' if multipart_upload_id else 'local',
+            'part_size_bytes': multipart_part_size,
+            'part_count': (size_bytes + multipart_part_size - 1) // multipart_part_size if multipart_part_size else None,
         }
     )
 
@@ -562,6 +644,8 @@ def upload_file(upload_session_id: str):
         upload_session = connection.execute('SELECT * FROM upload_sessions WHERE id = ?', (upload_session_id,)).fetchone()
     if not upload_session:
         return _json_error('Upload session not found.', 404)
+    if upload_session['multipart_upload_id']:
+        return _json_error('This upload must send parts directly to B2.', 409)
     if upload_session['status'] != 'uploading':
         return _json_error('Upload session is no longer accepting data.', 409)
 
@@ -618,6 +702,137 @@ def upload_file(upload_session_id: str):
     return jsonify({'ok': True, 'uploaded_bytes': bytes_written, 'video_id': upload_session['video_id']})
 
 
+@app.post('/api/video/upload/multipart/<upload_session_id>/parts')
+def multipart_part_urls(upload_session_id: str):
+    """Issue a small, validated batch of narrowly-scoped B2 UploadPart URLs."""
+    error = _require_auth()
+    if error:
+        return error
+
+    payload = request.get_json(silent=True) or {}
+    part_numbers = payload.get('part_numbers')
+    if not isinstance(part_numbers, list) or not part_numbers or len(part_numbers) > B2_MULTIPART_URL_BATCH_SIZE:
+        return _json_error(f'part_numbers must contain 1 to {B2_MULTIPART_URL_BATCH_SIZE} part numbers.', 400)
+    if len(set(part_numbers)) != len(part_numbers) or any(not isinstance(number, int) or isinstance(number, bool) for number in part_numbers):
+        return _json_error('part_numbers must be unique integers.', 400)
+
+    with get_db() as connection:
+        upload_session = connection.execute('SELECT * FROM upload_sessions WHERE id = ?', (upload_session_id,)).fetchone()
+    session_error = _multipart_session_error(upload_session)
+    if session_error:
+        return session_error
+    total_parts = _multipart_part_count(upload_session)
+    if any(number < 1 or number > total_parts for number in part_numbers):
+        return _json_error('Part number is outside the declared upload size.', 400)
+
+    try:
+        urls = [
+            {'part_number': number, 'url': storage.presigned_upload_part_url(upload_session['original_storage_key'], upload_session['multipart_upload_id'], number, B2_MULTIPART_URL_TTL_SECONDS)}
+            for number in part_numbers
+        ]
+    except Exception:
+        app.logger.exception('Failed to presign B2 upload parts')
+        return _json_error('Could not prepare upload parts.', 502)
+    return jsonify({'ok': True, 'parts': urls, 'expires_in': B2_MULTIPART_URL_TTL_SECONDS})
+
+
+@app.post('/api/video/upload/multipart/<upload_session_id>/complete')
+def complete_multipart_upload(upload_session_id: str):
+    """Complete from B2's ListParts result, never browser-provided ETags."""
+    error = _require_auth()
+    if error:
+        return error
+
+    with get_db() as connection:
+        upload_session = connection.execute('SELECT * FROM upload_sessions WHERE id = ?', (upload_session_id,)).fetchone()
+        if upload_session and upload_session['status'] == 'uploaded' and upload_session['multipart_upload_id']:
+            return jsonify({'ok': True, 'video_id': upload_session['video_id']})
+        session_error = _multipart_session_error(upload_session)
+        if session_error:
+            return session_error
+        claimed = connection.execute(
+            'UPDATE upload_sessions SET status = ? WHERE id = ? AND status = ?',
+            ('completing', upload_session_id, 'uploading'),
+        )
+        if claimed.rowcount != 1:
+            return _json_error('Multipart completion is already in progress.', 409)
+
+    expected_parts = _multipart_part_count(upload_session)
+    part_size = upload_session['multipart_part_size']
+    b2_completion_succeeded = False
+    try:
+        uploaded_parts = storage.list_multipart_parts(upload_session['original_storage_key'], upload_session['multipart_upload_id'])
+        if len(uploaded_parts) != expected_parts:
+            _abort_claimed_multipart_upload(upload_session, 'B2 does not contain every required upload part.')
+            return _json_error('B2 does not contain every required upload part.', 409)
+        completion_parts = []
+        for index, part in enumerate(uploaded_parts, start=1):
+            expected_size = part_size if index < expected_parts else upload_session['size_bytes'] - part_size * (expected_parts - 1)
+            if part.get('PartNumber') != index or part.get('Size') != expected_size or not part.get('ETag'):
+                _abort_claimed_multipart_upload(upload_session, 'B2 upload parts did not match the declared file.')
+                return _json_error('B2 upload parts do not match the declared file.', 409)
+            completion_parts.append({'PartNumber': part['PartNumber'], 'ETag': part['ETag']})
+        storage.complete_multipart_upload(upload_session['original_storage_key'], upload_session['multipart_upload_id'], completion_parts)
+        b2_completion_succeeded = True
+        if storage.object_size(upload_session['original_storage_key']) != upload_session['size_bytes']:
+            try:
+                storage.delete(upload_session['original_storage_key'])
+            except Exception:
+                app.logger.exception('Failed to clean up B2 source object after size verification failure')
+            _mark_multipart_session_aborted(upload_session_id, 'Completed B2 object size did not match the declared file size.')
+            return _json_error('Completed B2 object size did not match the declared file size.', 409)
+    except Exception:
+        app.logger.exception('Failed to complete B2 multipart upload')
+        if b2_completion_succeeded:
+            try:
+                storage.delete(upload_session['original_storage_key'])
+            except Exception:
+                app.logger.exception('Failed to clean up B2 source object after completion failure')
+            _mark_multipart_session_aborted(upload_session_id, 'B2 multipart completion failed.')
+        else:
+            _abort_claimed_multipart_upload(upload_session, 'B2 multipart completion failed.')
+        return _json_error('Could not complete multipart upload.', 502)
+
+    try:
+        created = _create_video_from_upload_session(upload_session)
+    except Exception:
+        app.logger.exception('Failed to persist completed B2 upload')
+        try:
+            storage.delete(upload_session['original_storage_key'])
+        except Exception:
+            app.logger.exception('Failed to clean up B2 source object after persistence failure')
+        _mark_multipart_session_aborted(upload_session_id, 'Completed B2 upload could not be persisted.')
+        return _json_error('Could not finalize multipart upload.', 500)
+    if created:
+        _launch_processing(upload_session['video_id'])
+    return jsonify({'ok': True, 'video_id': upload_session['video_id']})
+
+
+@app.post('/api/video/upload/multipart/<upload_session_id>/abort')
+def abort_multipart_upload(upload_session_id: str):
+    error = _require_auth()
+    if error:
+        return error
+
+    with get_db() as connection:
+        upload_session = connection.execute('SELECT * FROM upload_sessions WHERE id = ?', (upload_session_id,)).fetchone()
+        if not upload_session:
+            return _json_error('Upload session not found.', 404)
+        if not upload_session['multipart_upload_id']:
+            return _json_error('This upload does not use B2 multipart upload.', 409)
+        if upload_session['status'] == 'aborted':
+            return jsonify({'ok': True})
+        if upload_session['status'] != 'uploading':
+            return _json_error('Upload session can no longer be aborted.', 409)
+        connection.execute('UPDATE upload_sessions SET status = ?, completed_at = ? WHERE id = ?', ('aborted', utcnow_iso(), upload_session_id))
+    try:
+        storage.abort_multipart_upload(upload_session['original_storage_key'], upload_session['multipart_upload_id'])
+    except Exception:
+        app.logger.exception('Failed to abort B2 multipart upload %s', upload_session_id)
+        return _json_error('Upload was canceled locally but B2 cleanup failed.', 502)
+    return jsonify({'ok': True})
+
+
 @app.post('/api/video/upload/complete')
 def upload_complete():
     error = _require_auth()
@@ -657,6 +872,11 @@ def delete_video():
         connection.execute('DELETE FROM videos')
         connection.execute('DELETE FROM upload_sessions')
     for session_row in upload_sessions:
+        if session_row['multipart_upload_id'] and session_row['status'] == 'uploading':
+            try:
+                storage.abort_multipart_upload(session_row['original_storage_key'], session_row['multipart_upload_id'])
+            except Exception:
+                app.logger.warning('Could not abort multipart upload during delete: %s', session_row['id'])
         storage.delete(session_row['temporary_storage_key'])
     if _is_b2_storage() and storage.exists(CURRENT_VIDEO_MANIFEST_KEY):
         storage.delete(CURRENT_VIDEO_MANIFEST_KEY)
