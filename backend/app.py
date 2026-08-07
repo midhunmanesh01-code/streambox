@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import hashlib
 import hmac
 import os
@@ -25,6 +26,7 @@ from streambox.config import (
     SESSION_COOKIE_NAME,
     SIGNED_URL_TTL_SECONDS,
     STORAGE_BACKEND,
+    TEMP_DIR,
     UPLOAD_SESSION_TTL_SECONDS,
 )
 from streambox.db import get_db, init_db, utcnow_iso
@@ -45,6 +47,8 @@ CORS(app, supports_credentials=True, origins=[API_ALLOWED_ORIGIN])
 
 storage = get_storage_backend()
 init_db()
+
+CURRENT_VIDEO_MANIFEST_KEY = 'streambox/current.json'
 
 
 def _json_error(message: str, status_code: int):
@@ -133,9 +137,145 @@ def _get_visible_video(connection):
 def _delete_video_assets(video_row):
     if not video_row:
         return
+    seen_keys = set()
     for storage_key in (video_row['original_storage_key'], video_row['playback_storage_key']):
         if storage_key:
+            if storage_key in seen_keys:
+                continue
+            seen_keys.add(storage_key)
             storage.delete(storage_key)
+
+
+def _is_b2_storage() -> bool:
+    return STORAGE_BACKEND == 'b2'
+
+
+def _invalidate_storage_cache(storage_key: str) -> None:
+    if not _is_b2_storage():
+        return
+    storage.path_for_key(storage_key).unlink(missing_ok=True)
+
+
+def _current_video_manifest_from_row(row) -> dict:
+    return {
+        'id': row['id'],
+        'title': row['title'],
+        'original_filename': row['original_filename'],
+        'original_storage_key': row['original_storage_key'],
+        'playback_storage_key': row['playback_storage_key'],
+        'size_bytes': row['size_bytes'],
+        'uploaded_at': row['uploaded_at'],
+        'processing_status': row['processing_status'],
+        'error_message': row['error_message'],
+        'video_codec': row['video_codec'],
+        'audio_codec': row['audio_codec'],
+        'container': row['container'],
+        'width': row['width'],
+        'height': row['height'],
+        'duration': row['duration'],
+        'has_audio': int(bool(row['has_audio'])),
+        'playback_mime_type': row['playback_mime_type'],
+        'is_current': int(bool(row['is_current'])),
+        'uploaded_source_key': row['uploaded_source_key'],
+        'previous_video_id': row['previous_video_id'],
+    }
+
+
+def _write_current_video_manifest(row) -> None:
+    if not _is_b2_storage() or row is None:
+        return
+    try:
+        if row['processing_status'] != 'ready' or row['is_current'] != 1:
+            return
+    except (IndexError, KeyError):
+        return
+
+    manifest_path = TEMP_DIR / f'{CURRENT_VIDEO_MANIFEST_KEY.replace("/", "_")}-{uuid.uuid4().hex}.json'
+    manifest_path.write_text(json.dumps(_current_video_manifest_from_row(row), ensure_ascii=True), encoding='utf-8')
+
+    try:
+        _invalidate_storage_cache(CURRENT_VIDEO_MANIFEST_KEY)
+        storage.copy_path(manifest_path, CURRENT_VIDEO_MANIFEST_KEY)
+    finally:
+        manifest_path.unlink(missing_ok=True)
+        _invalidate_storage_cache(CURRENT_VIDEO_MANIFEST_KEY)
+
+
+def _read_current_video_manifest() -> dict | None:
+    if not _is_b2_storage() or not storage.exists(CURRENT_VIDEO_MANIFEST_KEY):
+        return None
+
+    try:
+        _invalidate_storage_cache(CURRENT_VIDEO_MANIFEST_KEY)
+        manifest_path = storage.read_path(CURRENT_VIDEO_MANIFEST_KEY)
+        return json.loads(manifest_path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        app.logger.warning('Failed to read current video manifest: %s', exc)
+        return None
+
+
+def _restore_current_video_from_manifest() -> None:
+    if not _is_b2_storage():
+        return
+
+    with get_db() as connection:
+        if _get_visible_video(connection):
+            return
+
+        manifest = _read_current_video_manifest()
+        if not manifest:
+            return
+
+        try:
+            if manifest.get('processing_status') != 'ready' or not manifest.get('is_current'):
+                return
+
+            playback_storage_key = manifest['playback_storage_key']
+            original_storage_key = manifest['original_storage_key']
+
+            if not storage.exists(playback_storage_key):
+                app.logger.warning('Skipping manifest restore because playback object is missing: %s', playback_storage_key)
+                return
+
+            if original_storage_key != playback_storage_key and not storage.exists(original_storage_key):
+                app.logger.warning('Skipping manifest restore because original object is missing: %s', original_storage_key)
+                return
+
+            existing = connection.execute('SELECT 1 FROM videos WHERE id = ?', (manifest['id'],)).fetchone()
+            if existing:
+                return
+
+            connection.execute(
+                'INSERT INTO videos (id, title, original_filename, original_storage_key, playback_storage_key, size_bytes, uploaded_at, processing_status, error_message, video_codec, audio_codec, container, width, height, duration, has_audio, playback_mime_type, is_current, uploaded_source_key, previous_video_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    manifest['id'],
+                    manifest['title'],
+                    manifest['original_filename'],
+                    manifest['original_storage_key'],
+                    manifest['playback_storage_key'],
+                    manifest['size_bytes'],
+                    manifest['uploaded_at'],
+                    'ready',
+                    manifest.get('error_message'),
+                    manifest.get('video_codec'),
+                    manifest.get('audio_codec'),
+                    manifest.get('container'),
+                    manifest.get('width'),
+                    manifest.get('height'),
+                    manifest.get('duration'),
+                    1 if manifest.get('has_audio') else 0,
+                    manifest.get('playback_mime_type') or 'video/mp4',
+                    1,
+                    manifest.get('uploaded_source_key'),
+                    manifest.get('previous_video_id'),
+                ),
+            )
+        except KeyError as exc:
+            app.logger.warning('Skipping invalid current video manifest missing field: %s', exc)
+        except Exception:
+            app.logger.exception('Failed to restore current video from manifest')
 
 def _is_browser_compatible(probe) -> bool:
     containers = set((probe.container or '').lower().split(','))
@@ -148,6 +288,7 @@ def _is_browser_compatible(probe) -> bool:
     )
 
 def _finalize_new_video(video_id: str):
+    final_row = None
     with get_db() as connection:
         row = connection.execute(
             'SELECT * FROM videos WHERE id = ?',
@@ -269,6 +410,11 @@ def _finalize_new_video(video_id: str):
                     (previous_current['id'],),
                 )
 
+            final_row = connection.execute(
+                'SELECT * FROM videos WHERE id = ?',
+                (video_id,),
+            ).fetchone()
+
         except (MediaValidationError, MediaProcessingError) as exc:
             connection.execute(
                 '''
@@ -293,6 +439,12 @@ def _finalize_new_video(video_id: str):
                 ''',
                 ('failed', str(exc), video_id),
             )
+
+    if final_row and _is_b2_storage():
+        try:
+            _write_current_video_manifest(final_row)
+        except Exception:
+            app.logger.exception('Failed to write current video manifest for %s', video_id)
 
 
 def _launch_processing(video_id: str):
@@ -333,6 +485,8 @@ def current_video():
     error = _require_auth()
     if error:
         return error
+
+    _restore_current_video_from_manifest()
 
     with get_db() as connection:
         row = _get_visible_video(connection)
@@ -493,6 +647,8 @@ def delete_video():
     if error:
         return error
 
+    _restore_current_video_from_manifest()
+
     with get_db() as connection:
         rows = connection.execute('SELECT * FROM videos').fetchall()
         upload_sessions = connection.execute('SELECT * FROM upload_sessions').fetchall()
@@ -502,6 +658,8 @@ def delete_video():
         connection.execute('DELETE FROM upload_sessions')
     for session_row in upload_sessions:
         storage.delete(session_row['temporary_storage_key'])
+    if _is_b2_storage() and storage.exists(CURRENT_VIDEO_MANIFEST_KEY):
+        storage.delete(CURRENT_VIDEO_MANIFEST_KEY)
     return jsonify({'ok': True})
 
 

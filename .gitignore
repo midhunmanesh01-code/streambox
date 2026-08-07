@@ -1,11 +1,25 @@
+# Node / Vite
 node_modules/
 dist/
+
+# Environment variables / secrets
 .env
 .env.*
 backend/.env
 backend/.env.*
+
+# Backend runtime data
+data/
 backend/data/
+
+# Python virtual environments
 backend/.venv/
 backend/venv/
+
+# Python cache
 backend/__pycache__/
 backend/**/*.pyc
+*.pyc
+
+# Temporary files
+app-diff.txt
