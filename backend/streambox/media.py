@@ -104,3 +104,18 @@ def transcode_for_browser(input_path: Path, output_path: Path, probe: MediaProbe
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise MediaProcessingError(result.stderr.strip() or 'Unable to prepare the playback version.')
+
+
+def remux_for_browser(input_path: Path, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        'ffmpeg', '-y', '-i', str(input_path),
+        '-map', '0:v:0',
+        '-map', '0:a:0?',
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise MediaProcessingError(result.stderr.strip() or 'Unable to remux the playback version.')

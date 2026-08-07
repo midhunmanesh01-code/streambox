@@ -4,6 +4,7 @@ import json
 import hashlib
 import hmac
 import os
+import shutil
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -33,7 +34,7 @@ from streambox.config import (
     UPLOAD_SESSION_TTL_SECONDS,
 )
 from streambox.db import get_db, init_db, utcnow_iso
-from streambox.media import MediaProcessingError, MediaValidationError, probe_media, transcode_for_browser
+from streambox.media import MediaProcessingError, MediaValidationError, probe_media, remux_for_browser, transcode_for_browser
 from streambox.storage import get_storage_backend
 
 app = Flask(__name__)
@@ -333,14 +334,29 @@ def _restore_current_video_from_manifest() -> None:
         except Exception:
             app.logger.exception('Failed to restore current video from manifest')
 
+def _has_browser_compatible_streams(probe) -> bool:
+    return (
+        probe.video_codec == 'h264'
+        and (not probe.has_audio or probe.audio_codec == 'aac')
+        and probe.pix_fmt in ('yuv420p', 'yuvj420p')
+    )
+
+
 def _is_browser_compatible(probe) -> bool:
     containers = set((probe.container or '').lower().split(','))
 
     return (
         'mp4' in containers
-        and probe.video_codec == 'h264'
-        and (not probe.has_audio or probe.audio_codec == 'aac')
-        and probe.pix_fmt in ('yuv420p', 'yuvj420p')
+        and _has_browser_compatible_streams(probe)
+    )
+
+
+def _can_remux_for_browser(probe) -> bool:
+    containers = set((probe.container or '').lower().split(','))
+
+    return (
+        'mp4' not in containers
+        and _has_browser_compatible_streams(probe)
     )
 
 def _finalize_new_video(video_id: str):
@@ -354,8 +370,21 @@ def _finalize_new_video(video_id: str):
         if not row or row['processing_status'] != 'processing':
             return
 
+        original_path = None
+        playback_path = None
         try:
             app.logger.warning("PROCESS: starting video %s", video_id)
+
+            disk_usage = shutil.disk_usage(TEMP_DIR)
+            app.logger.warning(
+                "PROCESS: DISK total=%d bytes (%.2f GB) used=%d bytes (%.2f GB) free=%d bytes (%.2f GB)",
+                disk_usage.total,
+                disk_usage.total / (1024 ** 3),
+                disk_usage.used,
+                disk_usage.used / (1024 ** 3),
+                disk_usage.free,
+                disk_usage.free / (1024 ** 3),
+            )
 
             original_path = storage.read_path(row['original_storage_key'])
             app.logger.warning("PROCESS: source downloaded %s", video_id)
@@ -372,15 +401,47 @@ def _finalize_new_video(video_id: str):
             # Already browser/TV friendly — don't waste CPU transcoding it.
             if _is_browser_compatible(probe):
                 app.logger.warning(
-                    "PROCESS: compatible source detected, skipping transcode %s",
+                    "PROCESS: DIRECT compatible source detected %s",
                     video_id,
                 )
 
                 playback_storage_key = row['original_storage_key']
 
+            elif _can_remux_for_browser(probe):
+                app.logger.warning(
+                    "PROCESS: REMUX compatible streams with incompatible container %s",
+                    video_id,
+                )
+
+                playback_path = storage.path_for_key(
+                    row['playback_storage_key']
+                )
+
+                remux_for_browser(
+                    original_path,
+                    playback_path,
+                )
+
+                app.logger.warning(
+                    "PROCESS: REMUX completed %s",
+                    video_id,
+                )
+
+                storage.copy_path(
+                    playback_path,
+                    row['playback_storage_key'],
+                )
+
+                app.logger.warning(
+                    "PROCESS: REMUX playback uploaded %s",
+                    video_id,
+                )
+
+                playback_storage_key = row['playback_storage_key']
+
             else:
                 app.logger.warning(
-                    "PROCESS: incompatible source, starting transcode %s",
+                    "PROCESS: TRANSCODE incompatible source %s",
                     video_id,
                 )
 
@@ -395,7 +456,7 @@ def _finalize_new_video(video_id: str):
                 )
 
                 app.logger.warning(
-                    "PROCESS: transcode completed %s",
+                    "PROCESS: TRANSCODE completed %s",
                     video_id,
                 )
 
@@ -405,17 +466,11 @@ def _finalize_new_video(video_id: str):
                 )
 
                 app.logger.warning(
-                    "PROCESS: playback uploaded %s",
+                    "PROCESS: TRANSCODE playback uploaded %s",
                     video_id,
                 )
 
                 playback_storage_key = row['playback_storage_key']
-
-                if STORAGE_BACKEND == 'b2':
-                    playback_path.unlink(missing_ok=True)
-
-            if STORAGE_BACKEND == 'b2':
-                original_path.unlink(missing_ok=True)
 
             previous_current = _get_current_ready_video(connection)
 
@@ -495,6 +550,20 @@ def _finalize_new_video(video_id: str):
                 ''',
                 ('failed', str(exc), video_id),
             )
+
+        finally:
+            if STORAGE_BACKEND == 'b2':
+                for temporary_path in (playback_path, original_path):
+                    if temporary_path is None:
+                        continue
+                    try:
+                        temporary_path.unlink(missing_ok=True)
+                    except OSError:
+                        app.logger.warning(
+                            'Failed to clean up processing temporary file for %s: %s',
+                            video_id,
+                            temporary_path,
+                        )
 
     if final_row and _is_b2_storage():
         try:
