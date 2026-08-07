@@ -828,7 +828,6 @@ def complete_multipart_upload(upload_session_id: str):
 
     expected_parts = _multipart_part_count(upload_session)
     part_size = upload_session['multipart_part_size']
-    b2_completion_succeeded = False
     try:
         uploaded_parts = storage.list_multipart_parts(upload_session['original_storage_key'], upload_session['multipart_upload_id'])
         if len(uploaded_parts) != expected_parts:
@@ -842,34 +841,15 @@ def complete_multipart_upload(upload_session_id: str):
                 return _json_error('B2 upload parts do not match the declared file.', 409)
             completion_parts.append({'PartNumber': part['PartNumber'], 'ETag': part['ETag']})
         storage.complete_multipart_upload(upload_session['original_storage_key'], upload_session['multipart_upload_id'], completion_parts)
-        b2_completion_succeeded = True
-        if storage.object_size(upload_session['original_storage_key']) != upload_session['size_bytes']:
-            try:
-                storage.delete(upload_session['original_storage_key'])
-            except Exception:
-                app.logger.exception('Failed to clean up B2 source object after size verification failure')
-            _mark_multipart_session_aborted(upload_session_id, 'Completed B2 object size did not match the declared file size.')
-            return _json_error('Completed B2 object size did not match the declared file size.', 409)
     except Exception:
         app.logger.exception('Failed to complete B2 multipart upload')
-        if b2_completion_succeeded:
-            try:
-                storage.delete(upload_session['original_storage_key'])
-            except Exception:
-                app.logger.exception('Failed to clean up B2 source object after completion failure')
-            _mark_multipart_session_aborted(upload_session_id, 'B2 multipart completion failed.')
-        else:
-            _abort_claimed_multipart_upload(upload_session, 'B2 multipart completion failed.')
+        _abort_claimed_multipart_upload(upload_session, 'B2 multipart completion failed.')
         return _json_error('Could not complete multipart upload.', 502)
 
     try:
         created = _create_video_from_upload_session(upload_session)
     except Exception:
         app.logger.exception('Failed to persist completed B2 upload')
-        try:
-            storage.delete(upload_session['original_storage_key'])
-        except Exception:
-            app.logger.exception('Failed to clean up B2 source object after persistence failure')
         _mark_multipart_session_aborted(upload_session_id, 'Completed B2 upload could not be persisted.')
         return _json_error('Could not finalize multipart upload.', 500)
     if created:
