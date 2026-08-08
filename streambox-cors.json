@@ -1,0 +1,18 @@
+﻿[
+  {
+    "allowedHeaders": ["authorization", "range"],
+    "allowedOperations": ["b2_download_file_by_id", "b2_download_file_by_name"],
+    "allowedOrigins": ["https://streambox-onf9.onrender.com"],
+    "corsRuleName": "downloadFromThisOneOrigin",
+    "exposeHeaders": null,
+    "maxAgeSeconds": 3600
+  },
+  {
+    "allowedHeaders": ["authorization", "range", "content-type"],
+    "allowedOperations": ["s3_head", "s3_get", "s3_put"],
+    "allowedOrigins": ["https://streambox-onf9.onrender.com"],
+    "corsRuleName": "s3DownloadAndUploadFromThisOneOrigin",
+    "exposeHeaders": null,
+    "maxAgeSeconds": 3600
+  }
+]

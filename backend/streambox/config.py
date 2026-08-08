@@ -12,6 +12,7 @@ DATA_DIR = Path(os.getenv('STREAMBOX_DATA_DIR', BASE_DIR / 'data'))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = Path(os.getenv('STREAMBOX_DB_PATH', DATA_DIR / 'streambox.sqlite3'))
+DATABASE_URL = os.getenv('DATABASE_URL')
 TEMP_DIR = Path(os.getenv('STREAMBOX_TEMP_DIR', DATA_DIR / 'tmp'))
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
