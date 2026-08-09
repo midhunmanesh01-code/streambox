@@ -34,7 +34,8 @@ export default function StreamingPage() {
   }
 
   const currentVideoIsReady = video?.processingStatus === 'ready'
-  const currentVideoIsProcessing = video && !currentVideoIsReady
+  const currentVideoIsFailed = video?.processingStatus === 'failed'
+  const currentVideoIsProcessing = video && !currentVideoIsReady && !currentVideoIsFailed
 
   return (
     <div className="min-h-screen bg-stage-950">
@@ -62,9 +63,25 @@ export default function StreamingPage() {
         {!loading && video?.processingStatus === 'failed' && !uploaderOpen && (
           <div className="max-w-2xl mx-auto rounded-2xl border border-signal-red/30 bg-signal-red/10 px-6 py-12 text-center animate-rise">
             <h2 className="font-display text-2xl text-ink-100 mb-2">Video processing failed</h2>
-            <p className="text-ink-500 text-sm max-w-md mx-auto">
-              StreamBox could not prepare this file for browser playback. Upload a different video to try again.
+            <p className="text-ink-500 text-sm max-w-md mx-auto mb-8">
+              StreamBox could not prepare this file for browser playback.
+              Replace it with a different video or delete it to start fresh.
             </p>
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReplaceClick}
+                className="flex items-center gap-2 text-sm border border-stage-600 hover:border-brass-400/60 hover:text-brass-300 text-ink-300 rounded-lg px-4 py-2 transition-colors"
+              >
+                <UploadCloud className="w-3.5 h-3.5" strokeWidth={2} />
+                Replace Video
+              </button>
+              <button
+                onClick={handleDeleteClick}
+                className="flex items-center gap-2 text-sm border border-stage-600 hover:border-signal-red/60 hover:text-signal-red text-ink-300 rounded-lg px-4 py-2 transition-colors"
+              >
+                Delete Video
+              </button>
+            </div>
           </div>
         )}
 

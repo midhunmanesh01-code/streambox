@@ -996,20 +996,55 @@ def transcode_video(video_id: str):
         original_path = None
         playback_path = None
         try:
+            app.logger.warning('TRANSCODE[%s]: starting — original_key=%s playback_key=%s storage=%s',
+                               video_id, row['original_storage_key'], row['playback_storage_key'], STORAGE_BACKEND)
+
+            disk_usage = shutil.disk_usage(TEMP_DIR)
+            app.logger.warning('TRANSCODE[%s]: disk total=%.2fGB used=%.2fGB free=%.2fGB',
+                               video_id,
+                               disk_usage.total / (1024 ** 3),
+                               disk_usage.used / (1024 ** 3),
+                               disk_usage.free / (1024 ** 3))
+
+            app.logger.warning('TRANSCODE[%s]: downloading source from storage key=%s',
+                               video_id, row['original_storage_key'])
             original_path = storage.read_path(row['original_storage_key'])
+            app.logger.warning('TRANSCODE[%s]: source downloaded to %s exists=%s size=%s',
+                               video_id, original_path, original_path.exists(),
+                               original_path.stat().st_size if original_path.exists() else 'missing')
+
             probe = probe_media(original_path)
+            app.logger.warning('TRANSCODE[%s]: probe done — container=%s video=%s audio=%s pix_fmt=%s '
+                               'width=%s height=%s duration=%s has_audio=%s',
+                               video_id, probe.container, probe.video_codec, probe.audio_codec,
+                               probe.pix_fmt, probe.width, probe.height, probe.duration, probe.has_audio)
+            app.logger.warning('TRANSCODE[%s]: compat check — is_browser_compatible=%s can_remux=%s',
+                               video_id, _is_browser_compatible(probe), _can_remux_for_browser(probe))
 
             playback_storage_key = row['playback_storage_key'] or f'videos/{video_id}/playback.mp4'
 
             if _can_remux_for_browser(probe):
+                app.logger.warning('TRANSCODE[%s]: path=REMUX (codecs compatible, wrong container) → %s',
+                                   video_id, playback_storage_key)
                 playback_path = storage.path_for_key(playback_storage_key)
                 remux_for_browser(original_path, playback_path)
+                app.logger.warning('TRANSCODE[%s]: remux complete, output exists=%s size=%s',
+                                   video_id, playback_path.exists(),
+                                   playback_path.stat().st_size if playback_path.exists() else 'missing')
+                app.logger.warning('TRANSCODE[%s]: uploading remux to storage key=%s', video_id, playback_storage_key)
                 storage.copy_path(playback_path, playback_storage_key)
+                app.logger.warning('TRANSCODE[%s]: remux uploaded', video_id)
             else:
-                # Full transcode (incompatible codecs or pixel format).
+                app.logger.warning('TRANSCODE[%s]: path=TRANSCODE (incompatible codecs/pix_fmt) → %s',
+                                   video_id, playback_storage_key)
                 playback_path = storage.path_for_key(playback_storage_key)
                 transcode_for_browser(original_path, playback_path, probe)
+                app.logger.warning('TRANSCODE[%s]: transcode complete, output exists=%s size=%s',
+                                   video_id, playback_path.exists(),
+                                   playback_path.stat().st_size if playback_path.exists() else 'missing')
+                app.logger.warning('TRANSCODE[%s]: uploading transcode to storage key=%s', video_id, playback_storage_key)
                 storage.copy_path(playback_path, playback_storage_key)
+                app.logger.warning('TRANSCODE[%s]: transcode uploaded', video_id)
 
             with get_db() as connection:
                 connection.execute(
@@ -1042,29 +1077,33 @@ def transcode_video(video_id: str):
                 if _is_b2_storage():
                     final_row = connection.execute('SELECT * FROM videos WHERE id = ?', (video_id,)).fetchone()
                     _write_current_video_manifest(final_row)
+            app.logger.warning('TRANSCODE[%s]: DB updated to ready, playback_key=%s', video_id, playback_storage_key)
 
         except (MediaValidationError, MediaProcessingError) as exc:
-            app.logger.warning('On-demand transcode failed for %s: %s', video_id, exc)
+            app.logger.warning('TRANSCODE[%s]: media error — %s: %s', video_id, type(exc).__name__, exc)
             with get_db() as connection:
                 connection.execute(
                     "UPDATE videos SET processing_status = 'failed', error_message = ? WHERE id = ?",
-                    (str(exc), video_id),
+                    (str(exc)[:1000], video_id),
                 )
-        except Exception:
-            app.logger.exception('On-demand transcode unexpected failure for %s', video_id)
+        except Exception as exc:
+            app.logger.exception('TRANSCODE[%s]: unexpected exception — %s: %s', video_id, type(exc).__name__, exc)
             with get_db() as connection:
                 connection.execute(
                     "UPDATE videos SET processing_status = 'failed', error_message = ? WHERE id = ?",
-                    ('Unexpected error during transcoding.', video_id),
+                    (f'{type(exc).__name__}: {exc}'[:1000], video_id),
                 )
         finally:
+            app.logger.warning('TRANSCODE[%s]: cleanup — original_path=%s playback_path=%s',
+                               video_id, original_path, playback_path)
             if _is_b2_storage():
                 for temp in (original_path, playback_path):
                     if temp is not None:
                         try:
                             temp.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                        except OSError as exc:
+                            app.logger.warning('TRANSCODE[%s]: could not delete temp file %s: %s',
+                                               video_id, temp, exc)
 
     thread = threading.Thread(target=_do_transcode, daemon=True)
     thread.start()
