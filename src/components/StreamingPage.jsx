@@ -60,7 +60,7 @@ export default function StreamingPage() {
           </div>
         )}
 
-        {!loading && video?.processingStatus === 'failed' && !uploaderOpen && (
+        {!loading && currentVideoIsFailed && !uploaderOpen && (
           <div className="max-w-2xl mx-auto rounded-2xl border border-signal-red/30 bg-signal-red/10 px-6 py-12 text-center animate-rise">
             <h2 className="font-display text-2xl text-ink-100 mb-2">Video processing failed</h2>
             <p className="text-ink-500 text-sm max-w-md mx-auto mb-8">
@@ -69,7 +69,7 @@ export default function StreamingPage() {
             </p>
             <div className="flex items-center justify-center gap-3">
               <button
-                onClick={handleReplaceClick}
+                onClick={() => setUploaderOpen(true)}
                 className="flex items-center gap-2 text-sm border border-stage-600 hover:border-brass-400/60 hover:text-brass-300 text-ink-300 rounded-lg px-4 py-2 transition-colors"
               >
                 <UploadCloud className="w-3.5 h-3.5" strokeWidth={2} />
