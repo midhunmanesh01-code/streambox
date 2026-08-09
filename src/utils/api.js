@@ -278,3 +278,17 @@ export async function waitForVideoReady(uploadSessionId, { intervalMs = 2000, ti
   throw new Error('Video processing is taking longer than expected.')
 }
 
+export async function apiRequestTranscode(videoId) {
+  const response = await fetch(joinUrl(`/api/video/${videoId}/transcode`), {
+    method: 'POST',
+    credentials: 'include',
+  })
+  return parseJsonResponse(response)
+}
+
+export async function apiGetVideo(videoId) {
+  const response = await fetch(joinUrl(`/api/video/current`), {
+    credentials: 'include',
+  })
+  return parseJsonResponse(response)
+}

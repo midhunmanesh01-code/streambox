@@ -299,17 +299,6 @@ def _restore_current_video_from_manifest() -> None:
             if manifest.get('processing_status') != 'ready' or not manifest.get('is_current'):
                 return
 
-            playback_storage_key = manifest['playback_storage_key']
-            original_storage_key = manifest['original_storage_key']
-
-            if not storage.exists(playback_storage_key):
-                app.logger.warning('Skipping manifest restore because playback object is missing: %s', playback_storage_key)
-                return
-
-            if original_storage_key != playback_storage_key and not storage.exists(original_storage_key):
-                app.logger.warning('Skipping manifest restore because original object is missing: %s', original_storage_key)
-                return
-
             existing = connection.execute('SELECT 1 FROM videos WHERE id = ?', (manifest['id'],)).fetchone()
             if existing:
                 return
@@ -343,6 +332,7 @@ def _restore_current_video_from_manifest() -> None:
             app.logger.warning('Skipping invalid current video manifest missing field: %s', exc)
         except Exception:
             app.logger.exception('Failed to restore current video from manifest')
+
 
 def _has_browser_compatible_streams(probe) -> bool:
     return (
@@ -955,6 +945,130 @@ def playback(token: str):
     if not path.exists():
         return _json_error('Playback file not found.', 404)
     return send_file(path, mimetype='video/mp4', conditional=True)
+
+
+@app.post('/api/video/<video_id>/transcode')
+def transcode_video(video_id: str):
+    """On-demand: transcode/remux the source so the browser can play it.
+
+    Called by the player when the native <video> element fires an error for the
+    original source file.  If a browser-compatible playback file already exists
+    (playback_storage_key differs from original_storage_key) we just return the
+    current ready URL without re-processing.  Otherwise we download the source,
+    probe it, remux with -c copy when codecs are already compatible, transcode
+    only when necessary, upload the result, and mark the video ready.
+    """
+    error = _require_auth()
+    if error:
+        return error
+
+    with get_db() as connection:
+        row = connection.execute('SELECT * FROM videos WHERE id = ?', (video_id,)).fetchone()
+    if not row:
+        return _json_error('Video not found.', 404)
+
+    # Already has a separate playback file — nothing to do.
+    if (
+        row['processing_status'] == 'ready'
+        and row['playback_storage_key']
+        and row['playback_storage_key'] != row['original_storage_key']
+    ):
+        return jsonify({'ok': True, 'video': _video_to_payload(row)})
+
+    # Another transcode is already running or failed.
+    if row['processing_status'] == 'processing':
+        return jsonify({'ok': True, 'status': 'processing', 'video': _video_to_payload(row)})
+    if row['processing_status'] == 'failed':
+        return jsonify({'ok': True, 'status': 'failed', 'video': _video_to_payload(row)})
+
+    # Mark as processing so concurrent calls are idempotent.
+    with get_db() as connection:
+        claimed = connection.execute(
+            "UPDATE videos SET processing_status = 'processing' WHERE id = ? AND processing_status = 'ready'",
+            (video_id,),
+        )
+        if claimed.rowcount != 1:
+            # Race — another request already claimed it.
+            row = connection.execute('SELECT * FROM videos WHERE id = ?', (video_id,)).fetchone()
+            return jsonify({'ok': True, 'status': row['processing_status'] if row else 'unknown', 'video': _video_to_payload(row)})
+
+    def _do_transcode():
+        original_path = None
+        playback_path = None
+        try:
+            original_path = storage.read_path(row['original_storage_key'])
+            probe = probe_media(original_path)
+
+            playback_storage_key = row['playback_storage_key'] or f'videos/{video_id}/playback.mp4'
+
+            if _can_remux_for_browser(probe):
+                playback_path = storage.path_for_key(playback_storage_key)
+                remux_for_browser(original_path, playback_path)
+                storage.copy_path(playback_path, playback_storage_key)
+            else:
+                # Full transcode (incompatible codecs or pixel format).
+                playback_path = storage.path_for_key(playback_storage_key)
+                transcode_for_browser(original_path, playback_path, probe)
+                storage.copy_path(playback_path, playback_storage_key)
+
+            with get_db() as connection:
+                connection.execute(
+                    '''
+                    UPDATE videos
+                    SET processing_status = 'ready',
+                        playback_storage_key = ?,
+                        playback_mime_type = 'video/mp4',
+                        video_codec = ?,
+                        audio_codec = ?,
+                        container = ?,
+                        width = ?,
+                        height = ?,
+                        duration = ?,
+                        has_audio = ?
+                    WHERE id = ?
+                    ''',
+                    (
+                        playback_storage_key,
+                        probe.video_codec,
+                        probe.audio_codec,
+                        probe.container,
+                        probe.width,
+                        probe.height,
+                        probe.duration,
+                        1 if probe.has_audio else 0,
+                        video_id,
+                    ),
+                )
+                if _is_b2_storage():
+                    final_row = connection.execute('SELECT * FROM videos WHERE id = ?', (video_id,)).fetchone()
+                    _write_current_video_manifest(final_row)
+
+        except (MediaValidationError, MediaProcessingError) as exc:
+            app.logger.warning('On-demand transcode failed for %s: %s', video_id, exc)
+            with get_db() as connection:
+                connection.execute(
+                    "UPDATE videos SET processing_status = 'failed', error_message = ? WHERE id = ?",
+                    (str(exc), video_id),
+                )
+        except Exception:
+            app.logger.exception('On-demand transcode unexpected failure for %s', video_id)
+            with get_db() as connection:
+                connection.execute(
+                    "UPDATE videos SET processing_status = 'failed', error_message = ? WHERE id = ?",
+                    ('Unexpected error during transcoding.', video_id),
+                )
+        finally:
+            if _is_b2_storage():
+                for temp in (original_path, playback_path):
+                    if temp is not None:
+                        try:
+                            temp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
+    thread = threading.Thread(target=_do_transcode, daemon=True)
+    thread.start()
+    return jsonify({'ok': True, 'status': 'processing', 'video': _video_to_payload(row)})
 
 
 @app.get('/api/health')

@@ -77,7 +77,7 @@ export default function StreamingPage() {
         )}
 
         {!loading && currentVideoIsReady && !uploaderOpen && (
-          <VideoPlayer video={video} onReplace={handleReplaceClick} onDelete={handleDeleteClick} />
+          <VideoPlayer video={video} onReplace={handleReplaceClick} onDelete={handleDeleteClick} onVideoUpdate={setCurrentVideo} />
         )}
 
         {!loading && video && uploaderOpen && (
