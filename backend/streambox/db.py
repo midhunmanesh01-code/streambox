@@ -35,9 +35,12 @@ CREATE TABLE IF NOT EXISTS videos (
     original_filename TEXT NOT NULL,
     original_storage_key TEXT NOT NULL,
     playback_storage_key TEXT,
+    source_b2_key TEXT,
+    playback_b2_key TEXT,
     size_bytes INTEGER NOT NULL,
     uploaded_at TEXT NOT NULL,
     processing_status TEXT NOT NULL,
+    processing_stage TEXT,
     error_message TEXT,
     video_codec TEXT,
     audio_codec TEXT,
@@ -49,8 +52,29 @@ CREATE TABLE IF NOT EXISTS videos (
     playback_mime_type TEXT,
     is_current INTEGER NOT NULL DEFAULT 0,
     uploaded_source_key TEXT,
-    previous_video_id TEXT
+    previous_video_id TEXT,
+    source_metadata TEXT,
+    playback_metadata TEXT
 );
+
+CREATE TABLE IF NOT EXISTS processing_jobs (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    stage TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    heartbeat_at TEXT,
+    locked_by TEXT,
+    force_transcode INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_video_id ON processing_jobs (video_id);
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs (status);
+CREATE INDEX IF NOT EXISTS idx_videos_processing_status ON videos (processing_status);
+CREATE INDEX IF NOT EXISTS idx_videos_is_current ON videos (is_current);
 """
 
 
@@ -97,9 +121,13 @@ def _connect_pg():
 
 
 def _connect_sqlite() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
+    connection = sqlite3.connect(DB_PATH, timeout=30.0)
     connection.row_factory = sqlite3.Row
     connection.execute('PRAGMA foreign_keys = ON')
+    try:
+        connection.execute('PRAGMA journal_mode = WAL')
+    except Exception:
+        pass
     return connection
 
 
@@ -116,8 +144,7 @@ def get_db() -> Iterator:
         yield connection
         connection.commit()
     except Exception:
-        if DATABASE_URL:
-            connection.rollback()
+        connection.rollback()
         raise
     finally:
         connection.close()
@@ -131,20 +158,48 @@ def init_db() -> None:
         if DATABASE_URL:
             # psycopg2 handles multi-statement strings in a single execute().
             connection.execute(SCHEMA)
+            # Idempotent column additions for existing PostgreSQL installations
+            for table, column, col_type in (
+                ('upload_sessions', 'multipart_upload_id', 'TEXT'),
+                ('upload_sessions', 'multipart_part_size', 'INTEGER'),
+                ('videos', 'source_b2_key', 'TEXT'),
+                ('videos', 'playback_b2_key', 'TEXT'),
+                ('videos', 'processing_stage', 'TEXT'),
+                ('videos', 'source_metadata', 'TEXT'),
+                ('videos', 'playback_metadata', 'TEXT'),
+                ('processing_jobs', 'heartbeat_at', 'TEXT'),
+                ('processing_jobs', 'locked_by', 'TEXT'),
+                ('processing_jobs', 'force_transcode', 'INTEGER DEFAULT 0'),
+            ):
+                connection.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}')
         else:
             # SQLite requires executescript() for multi-statement strings.
-            # executescript() is only available on the raw sqlite3.Connection.
             connection.executescript(SCHEMA)
-            # Existing installations predate direct B2 multipart uploads. SQLite has
-            # no ADD COLUMN IF NOT EXISTS, so make this migration explicitly idempotent.
-            columns = {row['name'] for row in connection.execute('PRAGMA table_info(upload_sessions)')}
-            for name, definition in (
+            # Idempotent column migrations for existing SQLite installations
+            def _migrate_sqlite_columns(table_name: str, cols: list[tuple[str, str]]):
+                existing_cols = {row['name'] for row in connection.execute(f'PRAGMA table_info({table_name})')}
+                for name, definition in cols:
+                    if name not in existing_cols:
+                        connection.execute(f'ALTER TABLE {table_name} ADD COLUMN {name} {definition}')
+
+            _migrate_sqlite_columns('upload_sessions', [
                 ('multipart_upload_id', 'TEXT'),
                 ('multipart_part_size', 'INTEGER'),
-            ):
-                if name not in columns:
-                    connection.execute(f'ALTER TABLE upload_sessions ADD COLUMN {name} {definition}')
+            ])
+            _migrate_sqlite_columns('videos', [
+                ('source_b2_key', 'TEXT'),
+                ('playback_b2_key', 'TEXT'),
+                ('processing_stage', 'TEXT'),
+                ('source_metadata', 'TEXT'),
+                ('playback_metadata', 'TEXT'),
+            ])
+            _migrate_sqlite_columns('processing_jobs', [
+                ('heartbeat_at', 'TEXT'),
+                ('locked_by', 'TEXT'),
+                ('force_transcode', 'INTEGER DEFAULT 0'),
+            ])
 
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+

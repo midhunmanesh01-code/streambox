@@ -34,16 +34,27 @@ from streambox.config import (
     UPLOAD_SESSION_TTL_SECONDS,
 )
 from streambox.db import get_db, init_db, utcnow_iso
-from streambox.media import MediaProcessingError, MediaValidationError, probe_media, remux_for_browser, transcode_for_browser
+from streambox.media import (
+    MediaProcessingError,
+    MediaValidationError,
+    probe_media,
+    verify_playback_asset,
+)
 from streambox.storage import get_storage_backend
+from streambox.worker import (
+    StreamBoxWorker,
+    cleanup_abandoned_upload_sessions,
+    enqueue_processing_job,
+    recover_stale_jobs,
+)
 
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=SECRET_KEY,
     SESSION_COOKIE_NAME=SESSION_COOKIE_NAME,
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='None',
-    SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE', '0') == '1',
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE', '0' if DEBUG else '1') == '1',
     MAX_CONTENT_LENGTH=MAX_UPLOAD_BYTES,
 )
 
@@ -100,26 +111,49 @@ def _parse_signed_token(token: str) -> dict | None:
 def _video_to_payload(row):
     if row is None:
         return None
+    r = dict(row)
     playback_url = None
-    if row['processing_status'] == 'ready' and row['playback_storage_key']:
+    playback_key = r.get('playback_storage_key') or r.get('playback_b2_key')
+    if r.get('processing_status') == 'ready' and playback_key:
         expires_at = _now() + timedelta(seconds=SIGNED_URL_TTL_SECONDS)
-        playback_url = f'/api/video/playback/{_signed_token(row["id"], row["playback_storage_key"], expires_at)}'
+        playback_url = f'/api/video/playback/{_signed_token(r["id"], playback_key, expires_at)}'
+
+    source_meta = None
+    if r.get('source_metadata'):
+        try:
+            source_meta = json.loads(r['source_metadata'])
+        except Exception:
+            pass
+
+    playback_meta = None
+    if r.get('playback_metadata'):
+        try:
+            playback_meta = json.loads(r['playback_metadata'])
+        except Exception:
+            pass
+
     return {
-        'id': row['id'],
-        'title': row['title'],
-        'original_filename': row['original_filename'],
-        'original_storage_key': row['original_storage_key'],
-        'playback_storage_key': row['playback_storage_key'],
-        'size_bytes': row['size_bytes'],
-        'uploaded_at': row['uploaded_at'],
-        'processing_status': row['processing_status'],
-        'video_codec': row['video_codec'],
-        'audio_codec': row['audio_codec'],
-        'container': row['container'],
-        'width': row['width'],
-        'height': row['height'],
-        'duration': row['duration'],
-        'has_audio': bool(row['has_audio']),
+        'id': r['id'],
+        'title': r['title'],
+        'original_filename': r['original_filename'],
+        'original_storage_key': r['original_storage_key'],
+        'playback_storage_key': playback_key,
+        'source_b2_key': r.get('source_b2_key') or r['original_storage_key'],
+        'playback_b2_key': playback_key,
+        'size_bytes': r['size_bytes'],
+        'uploaded_at': r['uploaded_at'],
+        'processing_status': r['processing_status'],
+        'processing_stage': r.get('processing_stage'),
+        'error_message': r.get('error_message'),
+        'video_codec': r.get('video_codec'),
+        'audio_codec': r.get('audio_codec'),
+        'container': r.get('container'),
+        'width': r.get('width'),
+        'height': r.get('height'),
+        'duration': r.get('duration'),
+        'has_audio': bool(r.get('has_audio')),
+        'source_metadata': source_meta,
+        'playback_metadata': playback_meta,
         'playback_url': playback_url,
     }
 
@@ -147,7 +181,10 @@ def _delete_video_assets(video_row):
             if storage_key in seen_keys:
                 continue
             seen_keys.add(storage_key)
-            storage.delete(storage_key)
+            try:
+                storage.delete(storage_key)
+            except Exception:
+                app.logger.warning('Could not delete storage key %s', storage_key)
 
 
 def _is_b2_storage() -> bool:
@@ -176,29 +213,58 @@ def _multipart_session_error(upload_session):
 
 
 def _create_video_from_upload_session(upload_session) -> bool:
-    is_b2 = _is_b2_storage()
-    playback_key = upload_session['original_storage_key'] if is_b2 else upload_session['playback_storage_key']
-    status = 'ready' if is_b2 else 'processing'
-    is_current = 1 if is_b2 else 0
+    video_id = upload_session['video_id']
+    playback_key = upload_session['playback_storage_key']
+    original_key = upload_session['original_storage_key']
 
     with get_db() as connection:
-        existing = connection.execute('SELECT 1 FROM videos WHERE id = ?', (upload_session['video_id'],)).fetchone()
+        existing = connection.execute('SELECT 1 FROM videos WHERE id = ?', (video_id,)).fetchone()
         if existing:
             return False
-        if is_b2:
-            connection.execute('UPDATE videos SET is_current = 0')
+
         connection.execute(
-            'INSERT INTO videos (id, title, original_filename, original_storage_key, playback_storage_key, size_bytes, uploaded_at, processing_status, video_codec, audio_codec, container, width, height, duration, has_audio, playback_mime_type, is_current, uploaded_source_key, previous_video_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (upload_session['video_id'], _sanitize_title(upload_session['original_filename']), upload_session['original_filename'], upload_session['original_storage_key'], playback_key, upload_session['size_bytes'], utcnow_iso(), status, None, None, None, None, None, None, 0, 'video/mp4', is_current, upload_session['temporary_storage_key'], None),
+            """
+            INSERT INTO videos (
+                id, title, original_filename, original_storage_key, playback_storage_key,
+                source_b2_key, playback_b2_key, size_bytes, uploaded_at, processing_status,
+                processing_stage, error_message, video_codec, audio_codec, container,
+                width, height, duration, has_audio, playback_mime_type, is_current,
+                uploaded_source_key, previous_video_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                video_id,
+                _sanitize_title(upload_session['original_filename']),
+                upload_session['original_filename'],
+                original_key,
+                playback_key,
+                original_key,
+                playback_key,
+                upload_session['size_bytes'],
+                utcnow_iso(),
+                'uploaded',
+                'queued',
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                'video/mp4',
+                0,
+                upload_session['temporary_storage_key'],
+                None,
+            ),
         )
         connection.execute(
             'UPDATE upload_sessions SET status = ?, uploaded_at = ?, completed_at = ? WHERE id = ? AND status = ?',
             ('uploaded', utcnow_iso(), utcnow_iso(), upload_session['id'], 'completing'),
         )
-        if is_b2:
-            row = connection.execute('SELECT * FROM videos WHERE id = ?', (upload_session['video_id'],)).fetchone()
-            _write_current_video_manifest(row)
-        return True
+
+    enqueue_processing_job(video_id)
+    return True
 
 
 def _mark_multipart_session_aborted(upload_session_id: str, message: str) -> None:
@@ -224,27 +290,33 @@ def _invalidate_storage_cache(storage_key: str) -> None:
 
 
 def _current_video_manifest_from_row(row) -> dict:
+    r = dict(row)
     return {
-        'id': row['id'],
-        'title': row['title'],
-        'original_filename': row['original_filename'],
-        'original_storage_key': row['original_storage_key'],
-        'playback_storage_key': row['playback_storage_key'],
-        'size_bytes': row['size_bytes'],
-        'uploaded_at': row['uploaded_at'],
-        'processing_status': row['processing_status'],
-        'error_message': row['error_message'],
-        'video_codec': row['video_codec'],
-        'audio_codec': row['audio_codec'],
-        'container': row['container'],
-        'width': row['width'],
-        'height': row['height'],
-        'duration': row['duration'],
-        'has_audio': int(bool(row['has_audio'])),
-        'playback_mime_type': row['playback_mime_type'],
-        'is_current': int(bool(row['is_current'])),
-        'uploaded_source_key': row['uploaded_source_key'],
-        'previous_video_id': row['previous_video_id'],
+        'id': r['id'],
+        'title': r['title'],
+        'original_filename': r['original_filename'],
+        'original_storage_key': r['original_storage_key'],
+        'playback_storage_key': r['playback_storage_key'],
+        'source_b2_key': r.get('source_b2_key') or r['original_storage_key'],
+        'playback_b2_key': r.get('playback_b2_key') or r['playback_storage_key'],
+        'size_bytes': r['size_bytes'],
+        'uploaded_at': r['uploaded_at'],
+        'processing_status': r['processing_status'],
+        'processing_stage': r.get('processing_stage'),
+        'error_message': r.get('error_message'),
+        'video_codec': r.get('video_codec'),
+        'audio_codec': r.get('audio_codec'),
+        'container': r.get('container'),
+        'width': r.get('width'),
+        'height': r.get('height'),
+        'duration': r.get('duration'),
+        'has_audio': int(bool(r.get('has_audio'))),
+        'playback_mime_type': r.get('playback_mime_type') or 'video/mp4',
+        'is_current': int(bool(r.get('is_current'))),
+        'uploaded_source_key': r.get('uploaded_source_key'),
+        'previous_video_id': r.get('previous_video_id'),
+        'source_metadata': r.get('source_metadata'),
+        'playback_metadata': r.get('playback_metadata'),
     }
 
 
@@ -304,15 +376,26 @@ def _restore_current_video_from_manifest() -> None:
                 return
 
             connection.execute(
-                'INSERT INTO videos (id, title, original_filename, original_storage_key, playback_storage_key, size_bytes, uploaded_at, processing_status, error_message, video_codec, audio_codec, container, width, height, duration, has_audio, playback_mime_type, is_current, uploaded_source_key, previous_video_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                """
+                INSERT INTO videos (
+                    id, title, original_filename, original_storage_key, playback_storage_key,
+                    source_b2_key, playback_b2_key, size_bytes, uploaded_at, processing_status,
+                    processing_stage, error_message, video_codec, audio_codec, container,
+                    width, height, duration, has_audio, playback_mime_type, is_current,
+                    uploaded_source_key, previous_video_id, source_metadata, playback_metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     manifest['id'],
                     manifest['title'],
                     manifest['original_filename'],
                     manifest['original_storage_key'],
                     manifest['playback_storage_key'],
+                    manifest.get('source_b2_key') or manifest['original_storage_key'],
+                    manifest.get('playback_b2_key') or manifest['playback_storage_key'],
                     manifest['size_bytes'],
                     manifest['uploaded_at'],
+                    'ready',
                     'ready',
                     manifest.get('error_message'),
                     manifest.get('video_codec'),
@@ -326,6 +409,8 @@ def _restore_current_video_from_manifest() -> None:
                     1,
                     manifest.get('uploaded_source_key'),
                     manifest.get('previous_video_id'),
+                    manifest.get('source_metadata'),
+                    manifest.get('playback_metadata'),
                 ),
             )
         except KeyError as exc:
@@ -334,247 +419,12 @@ def _restore_current_video_from_manifest() -> None:
             app.logger.exception('Failed to restore current video from manifest')
 
 
-def _has_browser_compatible_streams(probe) -> bool:
-    return (
-        probe.video_codec == 'h264'
-        and (not probe.has_audio or probe.audio_codec == 'aac')
-        and probe.pix_fmt in ('yuv420p', 'yuvj420p')
-    )
-
-
-def _is_browser_compatible(probe) -> bool:
-    containers = set((probe.container or '').lower().split(','))
-
-    return (
-        'mp4' in containers
-        and _has_browser_compatible_streams(probe)
-    )
-
-
-def _can_remux_for_browser(probe) -> bool:
-    containers = set((probe.container or '').lower().split(','))
-
-    return (
-        'mp4' not in containers
-        and _has_browser_compatible_streams(probe)
-    )
-
-def _finalize_new_video(video_id: str):
-    final_row = None
-    with get_db() as connection:
-        row = connection.execute(
-            'SELECT * FROM videos WHERE id = ?',
-            (video_id,)
-        ).fetchone()
-
-        if not row or row['processing_status'] != 'processing':
-            return
-
-        original_path = None
-        playback_path = None
-        try:
-            app.logger.warning("PROCESS: starting video %s", video_id)
-
-            disk_usage = shutil.disk_usage(TEMP_DIR)
-            app.logger.warning(
-                "PROCESS: DISK total=%d bytes (%.2f GB) used=%d bytes (%.2f GB) free=%d bytes (%.2f GB)",
-                disk_usage.total,
-                disk_usage.total / (1024 ** 3),
-                disk_usage.used,
-                disk_usage.used / (1024 ** 3),
-                disk_usage.free,
-                disk_usage.free / (1024 ** 3),
-            )
-
-            original_path = storage.read_path(row['original_storage_key'])
-            app.logger.warning("PROCESS: source downloaded %s", video_id)
-
-            probe = probe_media(original_path)
-            app.logger.warning(
-                "PROCESS: probe completed %s - video=%s audio=%s container=%s",
-                video_id,
-                probe.video_codec,
-                probe.audio_codec,
-                probe.container,
-            )
-
-            # Already browser/TV friendly — don't waste CPU transcoding it.
-            if _is_browser_compatible(probe):
-                app.logger.warning(
-                    "PROCESS: DIRECT compatible source detected %s",
-                    video_id,
-                )
-
-                playback_storage_key = row['original_storage_key']
-
-            elif _can_remux_for_browser(probe):
-                app.logger.warning(
-                    "PROCESS: REMUX compatible streams with incompatible container %s",
-                    video_id,
-                )
-
-                playback_path = storage.path_for_key(
-                    row['playback_storage_key']
-                )
-
-                remux_for_browser(
-                    original_path,
-                    playback_path,
-                )
-
-                app.logger.warning(
-                    "PROCESS: REMUX completed %s",
-                    video_id,
-                )
-
-                storage.copy_path(
-                    playback_path,
-                    row['playback_storage_key'],
-                )
-
-                app.logger.warning(
-                    "PROCESS: REMUX playback uploaded %s",
-                    video_id,
-                )
-
-                playback_storage_key = row['playback_storage_key']
-
-            else:
-                app.logger.warning(
-                    "PROCESS: TRANSCODE incompatible source %s",
-                    video_id,
-                )
-
-                playback_path = storage.path_for_key(
-                    row['playback_storage_key']
-                )
-
-                transcode_for_browser(
-                    original_path,
-                    playback_path,
-                    probe,
-                )
-
-                app.logger.warning(
-                    "PROCESS: TRANSCODE completed %s",
-                    video_id,
-                )
-
-                storage.copy_path(
-                    playback_path,
-                    row['playback_storage_key'],
-                )
-
-                app.logger.warning(
-                    "PROCESS: TRANSCODE playback uploaded %s",
-                    video_id,
-                )
-
-                playback_storage_key = row['playback_storage_key']
-
-            previous_current = _get_current_ready_video(connection)
-
-            connection.execute(
-                '''
-                UPDATE videos
-                SET processing_status = ?,
-                    video_codec = ?,
-                    audio_codec = ?,
-                    container = ?,
-                    width = ?,
-                    height = ?,
-                    duration = ?,
-                    has_audio = ?,
-                    playback_mime_type = ?,
-                    playback_storage_key = ?
-                WHERE id = ?
-                ''',
-                (
-                    'ready',
-                    probe.video_codec,
-                    probe.audio_codec,
-                    probe.container,
-                    probe.width,
-                    probe.height,
-                    probe.duration,
-                    1 if probe.has_audio else 0,
-                    'video/mp4',
-                    playback_storage_key,
-                    video_id,
-                ),
-            )
-
-            connection.execute(
-                'UPDATE videos SET is_current = 0 WHERE id != ?',
-                (video_id,),
-            )
-
-            connection.execute(
-                'UPDATE videos SET is_current = 1 WHERE id = ?',
-                (video_id,),
-            )
-
-            if previous_current and previous_current['id'] != video_id:
-                _delete_video_assets(previous_current)
-                connection.execute(
-                    'DELETE FROM videos WHERE id = ?',
-                    (previous_current['id'],),
-                )
-
-            final_row = connection.execute(
-                'SELECT * FROM videos WHERE id = ?',
-                (video_id,),
-            ).fetchone()
-
-        except (MediaValidationError, MediaProcessingError) as exc:
-            connection.execute(
-                '''
-                UPDATE videos
-                SET processing_status = ?, error_message = ?
-                WHERE id = ?
-                ''',
-                ('failed', str(exc), video_id),
-            )
-
-        except Exception as exc:
-            app.logger.exception(
-                "Video processing failed for %s",
-                video_id,
-            )
-
-            connection.execute(
-                '''
-                UPDATE videos
-                SET processing_status = ?, error_message = ?
-                WHERE id = ?
-                ''',
-                ('failed', str(exc), video_id),
-            )
-
-        finally:
-            if STORAGE_BACKEND == 'b2':
-                for temporary_path in (playback_path, original_path):
-                    if temporary_path is None:
-                        continue
-                    try:
-                        temporary_path.unlink(missing_ok=True)
-                    except OSError:
-                        app.logger.warning(
-                            'Failed to clean up processing temporary file for %s: %s',
-                            video_id,
-                            temporary_path,
-                        )
-
-    if final_row and _is_b2_storage():
-        try:
-            _write_current_video_manifest(final_row)
-        except Exception:
-            app.logger.exception('Failed to write current video manifest for %s', video_id)
-
-
-def _launch_processing(video_id: str):
-    thread = threading.Thread(target=_finalize_new_video, args=(video_id,), daemon=True)
-    thread.start()
+# Background worker instance
+worker = StreamBoxWorker(on_video_ready_callback=_write_current_video_manifest)
+STREAMBOX_EMBEDDED_WORKER = os.getenv('STREAMBOX_EMBEDDED_WORKER', '1' if DEBUG else '0') == '1'
+if STREAMBOX_EMBEDDED_WORKER:
+    if not app.debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        worker.start()
 
 
 @app.post('/api/auth/login')
@@ -660,7 +510,13 @@ def upload_init():
     try:
         with get_db() as connection:
             connection.execute(
-                'INSERT INTO upload_sessions (id, video_id, original_filename, content_type, size_bytes, temporary_storage_key, original_storage_key, playback_storage_key, status, created_at, expires_at, multipart_upload_id, multipart_part_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                """
+                INSERT INTO upload_sessions (
+                    id, video_id, original_filename, content_type, size_bytes,
+                    temporary_storage_key, original_storage_key, playback_storage_key,
+                    status, created_at, expires_at, multipart_upload_id, multipart_part_size
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     upload_session_id,
                     video_id,
@@ -690,6 +546,7 @@ def upload_init():
         {
             'ok': True,
             'upload_session_id': upload_session_id,
+            'video_id': video_id,
             'upload_url': f'/api/video/upload/{upload_session_id}',
             'temporary_storage_key': temp_key,
             'original_storage_key': original_key,
@@ -739,16 +596,26 @@ def upload_file(upload_session_id: str):
 
     with get_db() as connection:
         connection.execute(
-            'INSERT INTO videos (id, title, original_filename, original_storage_key, playback_storage_key, size_bytes, uploaded_at, processing_status, video_codec, audio_codec, container, width, height, duration, has_audio, playback_mime_type, is_current, uploaded_source_key, previous_video_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            """
+            INSERT INTO videos (
+                id, title, original_filename, original_storage_key, playback_storage_key,
+                source_b2_key, playback_b2_key, size_bytes, uploaded_at, processing_status,
+                processing_stage, video_codec, audio_codec, container, width, height, duration,
+                has_audio, playback_mime_type, is_current, uploaded_source_key, previous_video_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 upload_session['video_id'],
                 _sanitize_title(upload_session['original_filename']),
                 upload_session['original_filename'],
                 upload_session['original_storage_key'],
                 upload_session['playback_storage_key'],
+                upload_session['original_storage_key'],
+                upload_session['playback_storage_key'],
                 upload_session['size_bytes'],
                 utcnow_iso(),
-                'processing',
+                'uploaded',
+                'queued',
                 None,
                 None,
                 None,
@@ -767,8 +634,8 @@ def upload_file(upload_session_id: str):
             ('uploaded', utcnow_iso(), utcnow_iso(), upload_session_id),
         )
 
-    _launch_processing(upload_session['video_id'])
-    return jsonify({'ok': True, 'uploaded_bytes': bytes_written, 'video_id': upload_session['video_id']})
+    enqueue_processing_job(upload_session['video_id'])
+    return jsonify({'ok': True, 'uploaded_bytes': bytes_written, 'video_id': upload_session['video_id'], 'status': 'uploaded'})
 
 
 @app.post('/api/video/upload/multipart/<upload_session_id>/parts')
@@ -815,7 +682,7 @@ def complete_multipart_upload(upload_session_id: str):
     with get_db() as connection:
         upload_session = connection.execute('SELECT * FROM upload_sessions WHERE id = ?', (upload_session_id,)).fetchone()
         if upload_session and upload_session['status'] == 'uploaded' and upload_session['multipart_upload_id']:
-            return jsonify({'ok': True, 'video_id': upload_session['video_id']})
+            return jsonify({'ok': True, 'video_id': upload_session['video_id'], 'status': 'uploaded'})
         session_error = _multipart_session_error(upload_session)
         if session_error:
             return session_error
@@ -847,14 +714,13 @@ def complete_multipart_upload(upload_session_id: str):
         return _json_error('Could not complete multipart upload.', 502)
 
     try:
-        created = _create_video_from_upload_session(upload_session)
+        _create_video_from_upload_session(upload_session)
     except Exception:
         app.logger.exception('Failed to persist completed B2 upload')
         _mark_multipart_session_aborted(upload_session_id, 'Completed B2 upload could not be persisted.')
         return _json_error('Could not finalize multipart upload.', 500)
-    if created and not _is_b2_storage():
-        _launch_processing(upload_session['video_id'])
-    return jsonify({'ok': True, 'video_id': upload_session['video_id']})
+
+    return jsonify({'ok': True, 'video_id': upload_session['video_id'], 'status': 'uploaded'})
 
 
 @app.post('/api/video/upload/multipart/<upload_session_id>/abort')
@@ -871,9 +737,15 @@ def abort_multipart_upload(upload_session_id: str):
             return _json_error('This upload does not use B2 multipart upload.', 409)
         if upload_session['status'] == 'aborted':
             return jsonify({'ok': True})
-        if upload_session['status'] != 'uploading':
+        if upload_session['status'] in ('completing', 'uploaded'):
             return _json_error('Upload session can no longer be aborted.', 409)
-        connection.execute('UPDATE upload_sessions SET status = ?, completed_at = ? WHERE id = ?', ('aborted', utcnow_iso(), upload_session_id))
+        claimed = connection.execute(
+            'UPDATE upload_sessions SET status = ?, completed_at = ? WHERE id = ? AND status = ?',
+            ('aborted', utcnow_iso(), upload_session_id, 'uploading')
+        )
+        if claimed.rowcount != 1:
+            return jsonify({'ok': True})
+
     try:
         storage.abort_multipart_upload(upload_session['original_storage_key'], upload_session['multipart_upload_id'])
     except Exception:
@@ -916,19 +788,30 @@ def delete_video():
     with get_db() as connection:
         rows = connection.execute('SELECT * FROM videos').fetchall()
         upload_sessions = connection.execute('SELECT * FROM upload_sessions').fetchall()
-        for row in rows:
-            _delete_video_assets(row)
+        connection.execute('DELETE FROM processing_jobs')
         connection.execute('DELETE FROM videos')
         connection.execute('DELETE FROM upload_sessions')
+
+    for row in rows:
+        _delete_video_assets(row)
+
     for session_row in upload_sessions:
         if session_row['multipart_upload_id'] and session_row['status'] == 'uploading':
             try:
                 storage.abort_multipart_upload(session_row['original_storage_key'], session_row['multipart_upload_id'])
             except Exception:
                 app.logger.warning('Could not abort multipart upload during delete: %s', session_row['id'])
-        storage.delete(session_row['temporary_storage_key'])
+        try:
+            storage.delete(session_row['temporary_storage_key'])
+        except Exception:
+            pass
+
     if _is_b2_storage() and storage.exists(CURRENT_VIDEO_MANIFEST_KEY):
-        storage.delete(CURRENT_VIDEO_MANIFEST_KEY)
+        try:
+            storage.delete(CURRENT_VIDEO_MANIFEST_KEY)
+        except Exception:
+            pass
+
     return jsonify({'ok': True})
 
 
@@ -949,15 +832,7 @@ def playback(token: str):
 
 @app.post('/api/video/<video_id>/transcode')
 def transcode_video(video_id: str):
-    """On-demand: transcode/remux the source so the browser can play it.
-
-    Called by the player when the native <video> element fires an error for the
-    original source file.  If a browser-compatible playback file already exists
-    (playback_storage_key differs from original_storage_key) we just return the
-    current ready URL without re-processing.  Otherwise we download the source,
-    probe it, remux with -c copy when codecs are already compatible, transcode
-    only when necessary, upload the result, and mark the video ready.
-    """
+    """Emergency fallback endpoint for client player decode errors."""
     error = _require_auth()
     if error:
         return error
@@ -967,7 +842,7 @@ def transcode_video(video_id: str):
     if not row:
         return _json_error('Video not found.', 404)
 
-    # Already has a separate playback file — nothing to do.
+    # Already has a separate playback file that is ready
     if (
         row['processing_status'] == 'ready'
         and row['playback_storage_key']
@@ -975,139 +850,21 @@ def transcode_video(video_id: str):
     ):
         return jsonify({'ok': True, 'video': _video_to_payload(row)})
 
-    # Another transcode is already running or failed.
+    # Already processing
     if row['processing_status'] == 'processing':
         return jsonify({'ok': True, 'status': 'processing', 'video': _video_to_payload(row)})
-    if row['processing_status'] == 'failed':
-        return jsonify({'ok': True, 'status': 'failed', 'video': _video_to_payload(row)})
 
-    # Mark as processing so concurrent calls are idempotent.
+    # Reset video status and re-enqueue processing job with force_transcode=True
     with get_db() as connection:
-        claimed = connection.execute(
-            "UPDATE videos SET processing_status = 'processing' WHERE id = ? AND processing_status = 'ready'",
+        connection.execute(
+            "UPDATE videos SET processing_status = 'uploaded', processing_stage = 'queued', error_message = NULL WHERE id = ?",
             (video_id,),
         )
-        if claimed.rowcount != 1:
-            # Race — another request already claimed it.
-            row = connection.execute('SELECT * FROM videos WHERE id = ?', (video_id,)).fetchone()
-            return jsonify({'ok': True, 'status': row['processing_status'] if row else 'unknown', 'video': _video_to_payload(row)})
+    enqueue_processing_job(video_id, force_transcode=True)
 
-    def _do_transcode():
-        original_path = None
-        playback_path = None
-        try:
-            app.logger.warning('TRANSCODE[%s]: starting — original_key=%s playback_key=%s storage=%s',
-                               video_id, row['original_storage_key'], row['playback_storage_key'], STORAGE_BACKEND)
-
-            disk_usage = shutil.disk_usage(TEMP_DIR)
-            app.logger.warning('TRANSCODE[%s]: disk total=%.2fGB used=%.2fGB free=%.2fGB',
-                               video_id,
-                               disk_usage.total / (1024 ** 3),
-                               disk_usage.used / (1024 ** 3),
-                               disk_usage.free / (1024 ** 3))
-
-            app.logger.warning('TRANSCODE[%s]: downloading source from storage key=%s',
-                               video_id, row['original_storage_key'])
-            original_path = storage.read_path(row['original_storage_key'])
-            app.logger.warning('TRANSCODE[%s]: source downloaded to %s exists=%s size=%s',
-                               video_id, original_path, original_path.exists(),
-                               original_path.stat().st_size if original_path.exists() else 'missing')
-
-            probe = probe_media(original_path)
-            app.logger.warning('TRANSCODE[%s]: probe done — container=%s video=%s audio=%s pix_fmt=%s '
-                               'width=%s height=%s duration=%s has_audio=%s',
-                               video_id, probe.container, probe.video_codec, probe.audio_codec,
-                               probe.pix_fmt, probe.width, probe.height, probe.duration, probe.has_audio)
-            app.logger.warning('TRANSCODE[%s]: compat check — is_browser_compatible=%s can_remux=%s',
-                               video_id, _is_browser_compatible(probe), _can_remux_for_browser(probe))
-
-            playback_storage_key = row['playback_storage_key'] or f'videos/{video_id}/playback.mp4'
-
-            if _can_remux_for_browser(probe):
-                app.logger.warning('TRANSCODE[%s]: path=REMUX (codecs compatible, wrong container) → %s',
-                                   video_id, playback_storage_key)
-                playback_path = storage.path_for_key(playback_storage_key)
-                remux_for_browser(original_path, playback_path)
-                app.logger.warning('TRANSCODE[%s]: remux complete, output exists=%s size=%s',
-                                   video_id, playback_path.exists(),
-                                   playback_path.stat().st_size if playback_path.exists() else 'missing')
-                app.logger.warning('TRANSCODE[%s]: uploading remux to storage key=%s', video_id, playback_storage_key)
-                storage.copy_path(playback_path, playback_storage_key)
-                app.logger.warning('TRANSCODE[%s]: remux uploaded', video_id)
-            else:
-                app.logger.warning('TRANSCODE[%s]: path=TRANSCODE (incompatible codecs/pix_fmt) → %s',
-                                   video_id, playback_storage_key)
-                playback_path = storage.path_for_key(playback_storage_key)
-                transcode_for_browser(original_path, playback_path, probe)
-                app.logger.warning('TRANSCODE[%s]: transcode complete, output exists=%s size=%s',
-                                   video_id, playback_path.exists(),
-                                   playback_path.stat().st_size if playback_path.exists() else 'missing')
-                app.logger.warning('TRANSCODE[%s]: uploading transcode to storage key=%s', video_id, playback_storage_key)
-                storage.copy_path(playback_path, playback_storage_key)
-                app.logger.warning('TRANSCODE[%s]: transcode uploaded', video_id)
-
-            with get_db() as connection:
-                connection.execute(
-                    '''
-                    UPDATE videos
-                    SET processing_status = 'ready',
-                        playback_storage_key = ?,
-                        playback_mime_type = 'video/mp4',
-                        video_codec = ?,
-                        audio_codec = ?,
-                        container = ?,
-                        width = ?,
-                        height = ?,
-                        duration = ?,
-                        has_audio = ?
-                    WHERE id = ?
-                    ''',
-                    (
-                        playback_storage_key,
-                        probe.video_codec,
-                        probe.audio_codec,
-                        probe.container,
-                        probe.width,
-                        probe.height,
-                        probe.duration,
-                        1 if probe.has_audio else 0,
-                        video_id,
-                    ),
-                )
-                if _is_b2_storage():
-                    final_row = connection.execute('SELECT * FROM videos WHERE id = ?', (video_id,)).fetchone()
-                    _write_current_video_manifest(final_row)
-            app.logger.warning('TRANSCODE[%s]: DB updated to ready, playback_key=%s', video_id, playback_storage_key)
-
-        except (MediaValidationError, MediaProcessingError) as exc:
-            app.logger.warning('TRANSCODE[%s]: media error — %s: %s', video_id, type(exc).__name__, exc)
-            with get_db() as connection:
-                connection.execute(
-                    "UPDATE videos SET processing_status = 'failed', error_message = ? WHERE id = ?",
-                    (str(exc)[:1000], video_id),
-                )
-        except Exception as exc:
-            app.logger.exception('TRANSCODE[%s]: unexpected exception — %s: %s', video_id, type(exc).__name__, exc)
-            with get_db() as connection:
-                connection.execute(
-                    "UPDATE videos SET processing_status = 'failed', error_message = ? WHERE id = ?",
-                    (f'{type(exc).__name__}: {exc}'[:1000], video_id),
-                )
-        finally:
-            app.logger.warning('TRANSCODE[%s]: cleanup — original_path=%s playback_path=%s',
-                               video_id, original_path, playback_path)
-            if _is_b2_storage():
-                for temp in (original_path, playback_path):
-                    if temp is not None:
-                        try:
-                            temp.unlink(missing_ok=True)
-                        except OSError as exc:
-                            app.logger.warning('TRANSCODE[%s]: could not delete temp file %s: %s',
-                                               video_id, temp, exc)
-
-    thread = threading.Thread(target=_do_transcode, daemon=True)
-    thread.start()
-    return jsonify({'ok': True, 'status': 'processing', 'video': _video_to_payload(row)})
+    with get_db() as connection:
+        updated_row = connection.execute('SELECT * FROM videos WHERE id = ?', (video_id,)).fetchone()
+    return jsonify({'ok': True, 'status': 'processing', 'video': _video_to_payload(updated_row)})
 
 
 @app.get('/api/health')
@@ -1117,6 +874,8 @@ def health():
 
 def main():
     init_db()
+    if not worker._thread or not worker._thread.is_alive():
+        worker.start()
     app.run(host=APP_HOST, port=APP_PORT, debug=DEBUG)
 
 

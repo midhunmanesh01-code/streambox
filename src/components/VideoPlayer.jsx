@@ -4,6 +4,7 @@ import { formatBytes, formatDate, apiRequestTranscode, apiGetCurrentVideo, resol
 
 export default function VideoPlayer({ video, onReplace, onDelete, onVideoUpdate }) {
   const videoRef = useRef(null)
+  const fallbackAttemptedRef = useRef(new Set())
   const [muted, setMuted] = useState(false)
   const [volume, setVolume] = useState(1)
   const [transcoding, setTranscoding] = useState(false)
@@ -32,9 +33,50 @@ export default function VideoPlayer({ video, onReplace, onDelete, onVideoUpdate 
 
   const handleVideoError = async () => {
     if (transcoding || !video?.id) return
-    // Only kick off transcoding once per video; ignore transient network errors.
+
     const element = videoRef.current
-    if (element && element.error && element.error.code === MediaError.MEDIA_ERR_NETWORK) return
+    if (element && element.error) {
+      // Don't trigger on user aborted
+      if (element.error.code === 1) { // MEDIA_ERR_ABORTED
+        return
+      }
+    }
+
+    // First attempt: try refreshing the signed playback URL (e.g. expired 15-min token or stale presigned redirect)
+    try {
+      const refreshed = await apiGetCurrentVideo().catch(() => null)
+      const currentVideo = refreshed?.video
+      if (
+        currentVideo &&
+        currentVideo.id === video.id &&
+        currentVideo.playback_url &&
+        resolveApiUrl(currentVideo.playback_url) !== video.playbackUrl
+      ) {
+        onVideoUpdate?.({
+          id: currentVideo.id,
+          title: currentVideo.title,
+          originalFilename: currentVideo.original_filename,
+          sizeBytes: currentVideo.size_bytes,
+          uploadedAt: currentVideo.uploaded_at,
+          url: resolveApiUrl(currentVideo.playback_url),
+          playbackUrl: resolveApiUrl(currentVideo.playback_url),
+          processingStatus: currentVideo.processing_status,
+          videoCodec: currentVideo.video_codec,
+          audioCodec: currentVideo.audio_codec,
+          container: currentVideo.container,
+          width: currentVideo.width,
+          height: currentVideo.height,
+          duration: currentVideo.duration,
+          hasAudio: currentVideo.has_audio,
+        })
+        return
+      }
+    } catch {
+      // Proceed to fallback transcode if refresh fails
+    }
+
+    if (fallbackAttemptedRef.current.has(video.id)) return
+    fallbackAttemptedRef.current.add(video.id)
     setTranscoding(true)
     try {
       await apiRequestTranscode(video.id)

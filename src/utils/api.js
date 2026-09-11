@@ -255,21 +255,21 @@ export async function apiCompleteUpload(uploadSessionId) {
   return parseJsonResponse(response)
 }
 
-export async function waitForVideoReady(uploadSessionId, { intervalMs = 2000, timeoutMs = 120000 } = {}) {
+export async function waitForVideoReady(uploadSessionId, { intervalMs = 2000, timeoutMs = 120000, targetVideoId } = {}) {
   const startedAt = Date.now()
-  let attempts = 0
   while (Date.now() - startedAt < timeoutMs) {
     const result = await apiCompleteUpload(uploadSessionId)
     if (result.status === 'ready' && result.video) {
-      return result.video
+      if (!targetVideoId || result.video.id === targetVideoId) {
+        return result.video
+      }
     }
     if (result.status === 'failed') {
       throw new Error(result.video?.error_message || 'Video processing failed.')
     }
-    attempts += 1
-    if (attempts >= 3) {
+    if (targetVideoId) {
       const current = await apiGetCurrentVideo().catch(() => null)
-      if (current?.video?.processing_status === 'ready') {
+      if (current?.video?.id === targetVideoId && current?.video?.processing_status === 'ready') {
         return current.video
       }
     }

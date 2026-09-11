@@ -41,7 +41,7 @@ class StorageBackend(ABC):
     def copy_path(self, source_path: Path, destination_key: str) -> int:
         raise NotImplementedError
 
-    def presigned_get_url(self, storage_key: str, expires_in: int) -> str:
+    def presigned_get_url(self, storage_key: str, expires_in: int, response_content_type: str | None = 'video/mp4') -> str:
         raise NotImplementedError
 
     def create_multipart_upload(self, storage_key: str, content_type: str | None) -> str:
@@ -65,11 +65,13 @@ class StorageBackend(ABC):
 
 class LocalStorageBackend(StorageBackend):
     def __init__(self, root_dir: Path | str = LOCAL_STORAGE_DIR):
-        self.root_dir = Path(root_dir)
+        self.root_dir = Path(root_dir).resolve()
         self.root_dir.mkdir(parents=True, exist_ok=True)
 
     def _resolve(self, storage_key: str) -> Path:
-        path = self.root_dir / storage_key
+        path = (self.root_dir / storage_key).resolve()
+        if not path.is_relative_to(self.root_dir):
+            raise ValueError(f'Path traversal detected: {storage_key}')
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -106,15 +108,35 @@ class LocalStorageBackend(StorageBackend):
         return destination.stat().st_size
 
     def delete(self, storage_key: str) -> None:
-        path = self.root_dir / storage_key
+        path = self._resolve(storage_key)
         if path.exists():
             path.unlink()
 
     def exists(self, storage_key: str) -> bool:
-        return (self.root_dir / storage_key).exists()
+        return self._resolve(storage_key).exists()
 
-    def presigned_get_url(self, storage_key: str, expires_in: int) -> str:
+    def presigned_get_url(self, storage_key: str, expires_in: int, response_content_type: str | None = 'video/mp4') -> str:
         raise NotImplementedError('Local storage does not provide presigned URLs.')
+
+    def create_multipart_upload(self, storage_key: str, content_type: str | None) -> str:
+        return 'local_multipart_id'
+
+    def presigned_upload_part_url(self, storage_key: str, upload_id: str, part_number: int, expires_in: int) -> str:
+        return f'/api/video/upload/local_part/{part_number}'
+
+    def list_multipart_parts(self, storage_key: str, upload_id: str) -> list[dict]:
+        return []
+
+    def complete_multipart_upload(self, storage_key: str, upload_id: str, parts: list[dict]) -> None:
+        pass
+
+    def abort_multipart_upload(self, storage_key: str, upload_id: str) -> None:
+        pass
+
+    def object_size(self, storage_key: str) -> int:
+        path = self._resolve(storage_key)
+        return path.stat().st_size if path.exists() else 0
+
 
 
 class BackblazeB2StorageBackend(StorageBackend):
@@ -214,10 +236,13 @@ class BackblazeB2StorageBackend(StorageBackend):
                 return False
             raise
 
-    def presigned_get_url(self, storage_key: str, expires_in: int) -> str:
+    def presigned_get_url(self, storage_key: str, expires_in: int, response_content_type: str | None = 'video/mp4') -> str:
+        params = {'Bucket': self._bucket_name, 'Key': storage_key}
+        if response_content_type:
+            params['ResponseContentType'] = response_content_type
         return self._client.generate_presigned_url(
             'get_object',
-            Params={'Bucket': self._bucket_name, 'Key': storage_key},
+            Params=params,
             ExpiresIn=expires_in,
         )
 

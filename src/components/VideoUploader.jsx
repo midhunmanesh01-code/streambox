@@ -61,7 +61,9 @@ export default function VideoUploader({ onUploadComplete, autoOpen }) {
       setPercent(100)
       setUploadedBytes(selected.size)
 
-      const readyVideo = await waitForVideoReady(uploadSession.upload_session_id)
+      const readyVideo = await waitForVideoReady(uploadSession.upload_session_id, {
+        targetVideoId: uploadSession.video_id,
+      })
       setStatus('success')
       setTimeout(() => onUploadComplete(readyVideo), 300)
     } catch (uploadError) {
